@@ -30,6 +30,13 @@ from pygments.formatter import Formatter
 from pygments.formatters import Terminal256Formatter
 from wcwidth import wcswidth
 
+try:
+    import readline
+except ImportError:
+    pass
+else:
+    readline.parse_and_bind('tab: complete')
+
 CTRL = [1, 5]
 PAGE_UP = (-1, 126, [5])
 PAGE_DOWN = (-1, 126, [6])
@@ -57,13 +64,14 @@ HELP = """\
     -------
 
     h ......... show this help message
-    w ......... write file
+    w ......... write file (save)
+    W ......... write to new file (save as)
     <SPACE> ... start voice recording
     : ......... enter command via typing
     z ......... undo
     r ......... redo
     <ENTER> ... clear message
-    q ......... quit (TODO: ask for unsaved changes)
+    q ......... quit
 
     Use cursor keys, PAGE UP and PAGE DOWN to scroll.
     Use HOME/END to jump to the start/end of the line.
@@ -694,6 +702,31 @@ class VoiceCoder:
         else:
             self.set_message('Already at newest change', LEVEL_WARNING)
 
+    def prompt(self, prompt: str) -> str:
+        sys.stdout.write('\x1b[%dE' % (self.term_size.lines))
+        sys.stdout.write('\x1b[0K\r')
+        sys.stdout.flush()
+        with EchoedInput():
+            return input(prompt)
+
+    def save(self) -> None:
+        try:
+            with open(self.filename, 'w') as fp:
+                fp.write(self.content)
+        except Exception as exc:
+            self.set_message(str(exc), LEVEL_ERROR)
+        else:
+            self.saved = True
+            self.set_message('Written to file: ' + self.filename)
+
+    def save_as(self) -> None:
+        try:
+            self.filename = self.prompt('Filename: ')
+        except KeyboardInterrupt:
+            self.set_message('Cancelled')
+        else:
+            self.save()
+
     def _handle_input(self, input_data: InputData) -> bool:
         try:
             #raw, decoded = read_ansi(self.stdin)
@@ -701,18 +734,24 @@ class VoiceCoder:
             raw, decoded = input_data
 
             if raw == b'q':
-                # TODO: ask save
-                self.running = False
-                return False
-            elif raw == b'w':
-                try:
-                    with open(self.filename, 'w') as fp:
-                        fp.write(self.content)
-                except Exception as exc:
-                    self.set_message(str(exc), LEVEL_ERROR)
+                if not self.saved:
+                    while True:
+                        cmd = self.prompt('Save changes? y/n/C> ').strip().lower()
+
+                        if cmd == 'y' or cmd == 'yes' or cmd == 'save':
+                            self.save()
+                        elif cmd == 'n' or cmd == 'no':
+                            self.running = False
+                            return False
+                        elif cmd == 'c' or cmd == 'cancel':
+                            break
                 else:
-                    self.saved = True
-                    self.set_message('Written to file: ' + self.filename)
+                    self.running = False
+                    return False
+            elif raw == b'w':
+                self.save()
+            elif raw == b'W':
+                self.save_as()
             elif raw == b' ':
                 if self.recording:
                     self.recording = False
@@ -729,17 +768,16 @@ class VoiceCoder:
             elif raw == b':':
                 try:
                     if self.waiting_for_openai:
-                        self.set_message("Already wayting for an OpenAI action...", LEVEL_WARNING)
+                        self.set_message("Already waiting for an OpenAI action...", LEVEL_WARNING)
                     else:
                         # edit via text input
-                        sys.stdout.write('\x1b[%dE' % (self.term_size.lines))
-                        sys.stdout.write('\x1b[0K\r:')
-                        sys.stdout.flush()
-                        with EchoedInput():
-                            message = input('')
-
-                        self.waiting_for_openai = True
-                        self.message_queue.put((MessageType.TEXT, message))
+                        try:
+                            message = self.prompt(':')
+                        except KeyboardInterrupt:
+                            self.set_message('Cancelled')
+                        else:
+                            self.waiting_for_openai = True
+                            self.message_queue.put((MessageType.TEXT, message))
 
                 except Exception as exc:
                     self.set_message(str(exc), LEVEL_ERROR)
@@ -877,7 +915,8 @@ class VoiceCoder:
         scroll_xoffset = self.scroll_xoffset
         scroll_yoffset = self.scroll_yoffset
         lineno = scroll_yoffset + 1
-        max_yoffset = scroll_yoffset + self.term_size.lines
+        term_lines = self.term_size.lines
+        max_yoffset = scroll_yoffset + term_lines
         message = self.message
         if not message:
             if self.waiting_for_openai:
@@ -923,7 +962,8 @@ class VoiceCoder:
 
         max_lineno_len = len(str(len(self.lines) + 1))
         avail_columns = max(columns - max_lineno_len - 1, 0)
-        for line in self.lines[scroll_yoffset:max_yoffset]:
+        lines = self.lines[scroll_yoffset:max_yoffset]
+        for line in lines:
             # line number color
             sys.stdout.write('\x1b[38;5;244m')
             str_lineno = str(lineno).rjust(max_lineno_len) + ' '
@@ -943,6 +983,10 @@ class VoiceCoder:
             lineno += 1
 
         if message_lines:
+            skip_count = term_lines - len(lines) - len(message_lines) - 1
+            if skip_count > 0:
+                sys.stdout.write('\x1b[0K\n' * skip_count)
+
             if self.message_level == LEVEL_WARNING:
                 sys.stdout.write('\x1b[33m')
             elif self.message_level == LEVEL_ERROR:
