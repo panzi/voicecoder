@@ -249,7 +249,7 @@ def parse_content_update(message: str, old_content: str, lang: Optional[str]) ->
         if index >= 0:
             code = new_code + '\n' + old_content[index:]
 
-            print('reconstructing truncated code', file=sys.stderr)
+            #print('reconstructing truncated code', file=sys.stderr)
 
     return ContentUpdate(code=code, message=new_message or None)
 
@@ -474,7 +474,7 @@ class VoiceCoder:
             except KeyboardInterrupt:
                 pass
             except Exception as exc:
-                print('input thread: error', exc, file=sys.stderr)
+                #print('input thread: error', exc, file=sys.stderr)
                 self.event_queue.put((EventType.SET_MESSAGE, str(exc), LEVEL_ERROR))
 
     def _message_thread_func(self) -> None:
@@ -482,7 +482,7 @@ class VoiceCoder:
             try:
                 maybe_message = self.message_queue.get()
                 if maybe_message is None:
-                    print("message thread: quit", file=sys.stderr)
+                    #print("message thread: quit", file=sys.stderr)
                     return
                 else:
                     message_data = maybe_message
@@ -515,7 +515,7 @@ class VoiceCoder:
                 # TODO: put all context data in event, don't touch self here
                 start_lineno = self.scroll_yoffset + 1
                 end_lineno = max(start_lineno + self.term_size.lines + 1, 0)
-                print("message thread: processing", repr(user_message), file=sys.stderr)
+                #print("message thread: processing", repr(user_message), file=sys.stderr)
                 content = self.content
                 response = self.openai.chat.completions.create(
                     model="gpt-4-1106-preview",
@@ -538,17 +538,17 @@ class VoiceCoder:
                     ],
                     max_tokens=MAX_TOKENS
                 )
-                print("message thread: response:\n", response, file=sys.stderr)
+                #print("message thread: response:\n", response, file=sys.stderr)
 
                 choice = response.choices[0]
                 bot_message = choice.message.content or ''
                 update_data = parse_content_update(bot_message, content, lang)
 
-                print("message thread: parsed response:\n", update_data, file=sys.stderr)
+                #print("message thread: parsed response:\n", update_data, file=sys.stderr)
 
                 self.event_queue.put((EventType.CONTENT_UPDATE, update_data))
             except Exception as exc:
-                print('message thread: error', exc, file=sys.stderr)
+                #print('message thread: error', exc, file=sys.stderr)
                 self.event_queue.put((EventType.SET_MESSAGE, str(exc), LEVEL_ERROR))
             finally:
                 self.waiting_for_openai = False
@@ -608,7 +608,7 @@ class VoiceCoder:
                     stream.close()
 
             except Exception as exc:
-                print('recorder thread: error', exc, file=sys.stderr)
+                #print('recorder thread: error', exc, file=sys.stderr)
                 self.event_queue.put((EventType.SET_MESSAGE, str(exc), LEVEL_ERROR))
 
     @property
