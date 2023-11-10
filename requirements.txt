@@ -4,3 +4,4 @@ openai==1.2.0
 sounddevice==0.4.6
 wavio==0.0.8
 wcwidth==0.2.9
+python-dotenv==1.0.0
