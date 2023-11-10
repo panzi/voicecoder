@@ -58,7 +58,7 @@ HELP = """\
 
     h ......... show this help message
     w ......... write file
-    <SPACE> ... start voice recording (TODO)
+    <SPACE> ... start voice recording
     : ......... enter command via typing
     z ......... undo
     r ......... redo
