@@ -29,6 +29,7 @@ from pygments.lexers import find_lexer_class_for_filename
 from pygments.formatter import Formatter
 from pygments.formatters import Terminal256Formatter
 from wcwidth import wcswidth
+#from pydantic import BaseModel
 
 try:
     import readline
@@ -536,7 +537,19 @@ class VoiceCoder:
                             "content": user_message
                         }
                     ],
-                    max_tokens=MAX_TOKENS
+                    max_tokens=MAX_TOKENS,
+                    #functions=[
+                    #    {
+                    #        "name": "save",
+                    #        "description": "Save changes of current file",
+                    #        "parameters": {
+                    #            "type": "object",
+                    #            "properties": {},
+                    #            "required": [],
+                    #        }
+                    #    }
+                    #],
+                    #function_call='auto',
                 )
                 #print("message thread: response:\n", response, file=sys.stderr)
 
@@ -740,10 +753,12 @@ class VoiceCoder:
 
                         if cmd == 'y' or cmd == 'yes' or cmd == 'save':
                             self.save()
+                            self.running = False
+                            return False
                         elif cmd == 'n' or cmd == 'no':
                             self.running = False
                             return False
-                        elif cmd == 'c' or cmd == 'cancel':
+                        elif cmd == '' or cmd == 'c' or cmd == 'cancel':
                             break
                 else:
                     self.running = False
@@ -771,6 +786,7 @@ class VoiceCoder:
                         self.set_message("Already waiting for an OpenAI action...", LEVEL_WARNING)
                     else:
                         # edit via text input
+                        self.clear_message()
                         try:
                             message = self.prompt(':')
                         except KeyboardInterrupt:
