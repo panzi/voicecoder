@@ -11,11 +11,12 @@ import io
 import sys
 import optparse
 import termios
+import xdelta3
 # import sounddevice
 # import wavio
 
 from os import get_terminal_size
-from signal import signal, SIGWINCH
+from signal import signal, SIGWINCH, SIG_DFL
 from openai import OpenAI
 from pygments import format as colorize
 from pygments.lexer import Lexer
@@ -33,6 +34,8 @@ LEVEL_INFO    = 0
 LEVEL_WARNING = 1
 LEVEL_ERROR   = 2
 
+MAX_UNDO_STEPS = 1024
+
 MAX_TOKENS = 4096
 SYSTEM_MESSAGE_CONTENT = """\
 You're a programming accessibility tool. You will get natural language describing code and answer with valid {lang}. The natural language input comes from voice recognition and thus will omit a lot of special characters which you will have to fill in. Be sure to always echo back the whole edited file. Keep any messages about what you where doing very short.
@@ -43,7 +46,24 @@ The name of the current file is:
 The user is currently viewing line {start_lineno} to {end_lineno} of this file.
 
 This is the content of the file:
-{code}
+{code}"""
+
+HELP = """\
+    Hotkeys
+    -------
+
+    h ......... show this help message
+    w ......... write file
+    <SPACE> ... start voice recording (TODO)
+    : ......... enter command via typing
+    z ......... undo
+    r ......... redo
+    <ENTER> ... clear message
+    q ......... quit (TODO: ask for unsaved changes)
+
+    Use cursor keys, PAGE UP and PAGE DOWN to scroll.
+    Use HOME/END to jump to the start/end of the line.
+    Use Ctrl+HOME/Ctrl+END to jump to the start/end of the file.
 """
 
 class UnbufferedInput:
@@ -248,7 +268,7 @@ class VoiceCoder:
     __slots__ = (
         'scroll_xoffset', 'scroll_yoffset', 'filename', 'stdin', 'term_size',
         'lexer', 'content', 'saved', 'lines', 'formatter', 'max_line_width',
-        'message', 'message_level', 'openai'
+        'message', 'message_level', 'openai', 'undo_history', 'redo_history',
     )
 
     scroll_xoffset: int
@@ -262,9 +282,11 @@ class VoiceCoder:
     lines: list[list[tuple[_TokenType, str]]]
     saved: bool
     max_line_width: int
-    message: Optional[str]
+    message: Optional[list[str]]
     message_level: int
     openai: OpenAI
+    undo_history: list[tuple[bytes, bytes]]
+    redo_history: list[tuple[bytes, bytes]]
 
     def __init__(self, filename: str) -> None:
         self.scroll_xoffset = 0
@@ -277,6 +299,8 @@ class VoiceCoder:
         self.message = None
         self.message_level = LEVEL_INFO
         self.openai = OpenAI()
+        self.undo_history = []
+        self.redo_history = []
 
         with open(self.filename, 'rt') as fp:
             self.content = fp.read()
@@ -297,6 +321,69 @@ class VoiceCoder:
     @property
     def max_xoffset(self) -> int:
         return max(self.max_line_width - (self.term_size.columns - len(str(len(self.lines))) - 2), 0)
+    
+    def clear_message(self) -> None:
+        self.message = None
+        self.message_level = LEVEL_INFO
+
+    def set_message(self, message: str, level: int=LEVEL_INFO) -> None:
+        self.message = message.split('\n')
+        self.message_level = level
+
+    def show_unknown_shortcut(self) -> None:
+        self.set_message("Unknown shortcut", LEVEL_WARNING)
+
+    def set_content(self, content: str) -> None:
+        self.content = content
+
+        self.lines = tokenized_lines(content, self.lexer)
+        self.max_line_width = max(
+            wcswidth(''.join(tok_data for _, tok_data in line))
+            for line in self.lines
+        )
+
+        max_xoffset = self.max_xoffset
+        max_yoffset = self.max_yoffset
+
+        if self.scroll_xoffset > max_xoffset:
+            self.scroll_xoffset = max_xoffset
+
+        if self.scroll_yoffset > max_yoffset:
+            self.scroll_yoffset = max_yoffset
+
+    def edit(self, new_content: str) -> None:
+        new_bytes = new_content.encode()
+        old_bytes = self.content.encode()
+        undo = xdelta3.encode(new_bytes, old_bytes)
+        redo = xdelta3.encode(old_bytes, new_bytes)
+        self.undo_history.append((undo, redo))
+        if len(self.undo_history) > MAX_UNDO_STEPS:
+            del self.undo_history[0]
+        self.set_content(new_content)
+        self.redo_history.clear()
+        self.saved = False
+
+    def undo(self) -> None:
+        if self.undo_history:
+            item = self.undo_history.pop()
+            undo, _redo = item
+            content = self.content.encode()
+            new_content = xdelta3.decode(content, undo)
+            self.set_content(new_content.decode())
+            self.redo_history.append(item)
+        else:
+            self.set_message('Already at oldest change', LEVEL_WARNING)
+
+    def redo(self) -> None:
+        if self.redo_history:
+            item = self.redo_history.pop()
+            _undo, redo = item
+            content = self.content.encode()
+            new_content = xdelta3.decode(content, redo)
+            self.set_content(new_content.decode())
+            self.undo_history.append(item)
+        else:
+            self.set_message('Already at newest change', LEVEL_WARNING)
 
     def start(self) -> None:
         signal(SIGWINCH, self._handle_sigwinch)
@@ -312,9 +399,6 @@ class VoiceCoder:
                         raw, decoded = read_ansi(self.stdin)
                         #print(raw, decoded)
 
-                        self.message = None
-                        self.message_level = LEVEL_INFO
-
                         if raw == b'q':
                             # TODO: ask save
                             break
@@ -323,16 +407,21 @@ class VoiceCoder:
                                 with open(self.filename, 'w') as fp:
                                     fp.write(self.content)
                             except Exception as exc:
-                                self.message_level = LEVEL_ERROR
-                                self.message = str(exc)
+                                self.set_message(str(exc), LEVEL_ERROR)
                             else:
                                 self.saved = True
-                                self.message = 'Written to file: ' + self.filename
-                                self.message_level = LEVEL_INFO
+                                self.set_message('Written to file: ' + self.filename)
                         elif raw == b' ':
-                            self.message = "Please speak now..."
-                            self.message_level = LEVEL_INFO
+                            self.set_message("Please speak now...")
                             # TODO: record voice in a thread until space is pressed again
+                        elif raw == b'\n':
+                            self.clear_message()
+                        elif raw == b'z':
+                            self.undo()
+                        elif raw == b'r':
+                            self.redo()
+                        elif raw == b'h':
+                            self.set_message(HELP)
                         elif raw == b':':
                             try:
                                 # edit via text input
@@ -342,8 +431,7 @@ class VoiceCoder:
                                 with EchoedInput():
                                     text = input(':')
 
-                                self.message = "Wating for OpenAI..."
-                                self.message_level = LEVEL_INFO
+                                self.set_message("Wating for OpenAI...")
                                 self.redraw()
 
                                 if self.lexer:
@@ -381,39 +469,20 @@ class VoiceCoder:
                                 res = parse_response(message)
 
                                 if res.message:
-                                    self.message = res.message
-                                    self.message_level = res.message_level
+                                    self.set_message(res.message, res.message_level)
                                 else:
-                                    self.message = None
-                                    self.message_level = LEVEL_INFO
+                                    self.clear_message()
 
-                                if res.code is not None:
-                                    self.content = res.code
-
-                                    self.lines = tokenized_lines(self.content, self.lexer)
-                                    self.max_line_width = max(
-                                        wcswidth(''.join(tok_data for _, tok_data in line))
-                                        for line in self.lines
-                                    )
-
-                                    max_xoffset = self.max_xoffset
-                                    max_yoffset = self.max_yoffset
-
-                                    if self.scroll_xoffset > max_xoffset:
-                                        self.scroll_xoffset = max_xoffset
-
-                                    if self.scroll_yoffset > max_yoffset:
-                                        self.scroll_yoffset = max_yoffset
-
-                                    self.saved = False
+                                new_content = res.code
+                                if new_content is not None:
+                                    self.edit(new_content)
 
                                 # DEBUG:
                                 #with open("/tmp/response.json", "w") as fp:
                                 #    fp.write(choice.message.json())
 
                             except Exception as exc:
-                                self.message_level = LEVEL_ERROR
-                                self.message = str(exc)
+                                self.set_message(str(exc), LEVEL_ERROR)
                         elif decoded:
                             prefix, suffix, args = decoded
                             if prefix == -1:
@@ -442,17 +511,23 @@ class VoiceCoder:
                                     self.scroll_yoffset = max(self.scroll_yoffset - self.term_size.lines, 0)
                                 elif decoded == PAGE_DOWN:
                                     self.scroll_yoffset = min(self.scroll_yoffset + self.term_size.lines, self.max_yoffset)
+                                else:
+                                    self.show_unknown_shortcut()
+                            else:
+                                self.show_unknown_shortcut()
+                        else:
+                            self.show_unknown_shortcut()
                     except KeyboardInterrupt:
-                        self.message = "Keyboard Interrrupt, use q for quit"
-                        self.message_level = LEVEL_WARNING
+                        self.set_message("Keyboard Interrrupt, use q for quit", LEVEL_WARNING)
                     except Exception as exc:
-                        self.message = str(exc)
-                        self.message_level = LEVEL_ERROR
+                        self.set_message(str(exc), LEVEL_ERROR)
             finally:
                 # show cursor
                 sys.stdout.write('\x1b[?25h')
                 sys.stdout.write('\n')
                 sys.stdout.flush()
+
+                signal(SIGWINCH, SIG_DFL)
 
     def __enter__(self) -> None:
         pass
@@ -474,40 +549,90 @@ class VoiceCoder:
         self.redraw()
 
     def redraw(self) -> None:
-        # clear screen
-        # sys.stdout.write('\x1b[2J')
+        columns = self.term_size.columns
+        if columns == 0:
+            # clear screen
+            sys.stdout.write('\x1b[2J')
+            return
+
         # move cursor to upper left corner
         sys.stdout.write('\x1b[H')
 
-        columns = self.term_size.columns
         scroll_xoffset = self.scroll_xoffset
         scroll_yoffset = self.scroll_yoffset
         lineno = scroll_yoffset + 1
         max_yoffset = scroll_yoffset + self.term_size.lines
         message = self.message
-        if message is not None:
-            max_yoffset = max(max_yoffset - 1, 0)
+        message_lines: list[str] = []
+        if message is not None and columns > 0:
+            # wrapping message lines
+            for line in message:
+                w = wcswidth(line)
+                if w > columns:
+                    prev = 0
+                    line_len = len(line)
+                    while prev < line_len:
+                        next_prev = line_len
+                        start_index = prev
+                        end_index = prev
+                        for index in range(min(max(next_prev, prev + columns - 1), line_len), line_len + 1):
+                            chunk = line[start_index:index]
+                            w = wcswidth(chunk)
+                            if w > columns:
+                                end_index = index - 1
+                                if end_index <= prev:
+                                    next_prev = prev + 1
+                                else:
+                                    next_prev = end_index
+                                break
+                            elif w == columns:
+                                next_prev = index
+                                end_index = index
+                                break
+
+                        message_lines.append(line[start_index:end_index])
+                        max_yoffset -= 1
+                        prev = next_prev
+                else:
+                    message_lines.append(line)
+                    max_yoffset -= 1
+
+            if max_yoffset < 0:
+                max_yoffset = 0
 
         max_lineno_len = len(str(max_yoffset))
         avail_columns = max(columns - max_lineno_len - 1, 0)
         for line in self.lines[scroll_yoffset:max_yoffset]:
-            sys.stdout.write(str(lineno).rjust(max_lineno_len) + ' ')
-            tokens = slice_token_line(line, scroll_xoffset, avail_columns)
-            colorize(tokens, self.formatter, sys.stdout)
+            # line number color
+            sys.stdout.write('\x1b[38;5;244m')
+            str_lineno = str(lineno).rjust(max_lineno_len) + ' '
+            if len(str_lineno) > columns:
+                sys.stdout.write(str_lineno[:columns])
+            else:
+                sys.stdout.write(str_lineno)
+            # normal color
+            sys.stdout.write('\x1b[0m')
+            if avail_columns > 0:
+                tokens = slice_token_line(line, scroll_xoffset, avail_columns)
+                colorize(tokens, self.formatter, sys.stdout)
             # clear to end of line
             sys.stdout.write('\x1b[0K')
             if lineno < max_yoffset:
                 sys.stdout.write('\n')
             lineno += 1
 
-        if message is not None:
-            sys.stdout.write('\n')
+        if message_lines:
             if self.message_level == LEVEL_WARNING:
                 sys.stdout.write('\x1b[33m')
             elif self.message_level == LEVEL_ERROR:
                 sys.stdout.write('\x1b[31m')
 
-            sys.stdout.write(message)
+            for line in message_lines:
+                sys.stdout.write('\n')
+                sys.stdout.write(line)
+
+                # clear to end of line
+                sys.stdout.write('\x1b[0K')
 
             if self.message_level != LEVEL_INFO:
                 sys.stdout.write('\x1b[0m')
