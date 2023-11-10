@@ -12,8 +12,9 @@ import sys
 import optparse
 import termios
 # import xdelta3 # XXX: broken?
-# import sounddevice
-# import wavio
+import sounddevice
+import wavio
+import numpy as np
 
 from os import get_terminal_size
 from signal import signal, SIGWINCH, SIG_DFL
@@ -93,6 +94,15 @@ Event = Union[
     tuple[Literal[EventType.SET_MESSAGE], str, int],
 ]
 
+class MessageType(Enum):
+    TEXT = 1
+    VOICE = 2
+
+Message = Union[
+    tuple[Literal[MessageType.TEXT], str],
+    tuple[Literal[MessageType.VOICE], Union[bytes, bytearray, memoryview]],
+]
+
 class UnbufferedInput:
     __slots__ = 'old_attrs',
 
@@ -164,9 +174,13 @@ REST_UNCHANGED_MARKS: dict[Optional[str], str] = {
 }
 
 def parse_content_update(message: str, old_content: str, lang: Optional[str]) -> ContentUpdate:
-    index = 0 if message.startswith('```') else message.find('\n```')
-    if index == -1:
-        return ContentUpdate(message=message)
+    if message.startswith('```'):
+        index = 0
+    else:
+        index = message.find('\n```')
+        if index == -1:
+            return ContentUpdate(message=message)
+        index += 1
 
     start_index = message.find('\n', index)
     if start_index == -1:
@@ -356,6 +370,7 @@ class VoiceCoder:
         'message', 'message_level', 'openai', 'undo_history', 'redo_history',
         'event_queue', 'input_thread', 'message_thread', 'recorder_thread',
         'message_queue', 'input_semaphore', 'waiting_for_openai', 'running',
+        'recorder_semaphore', 'recording',
     )
 
     scroll_xoffset: int
@@ -378,11 +393,13 @@ class VoiceCoder:
     undo_history: list[tuple[str, str]]
     redo_history: list[tuple[str, str]]
     event_queue: Queue[Event]
-    message_queue: Queue[Optional[str]]
+    message_queue: Queue[Optional[Message]]
     input_thread: Thread
     message_thread: Thread
     recorder_thread: Thread
     input_semaphore: Semaphore
+    recorder_semaphore: Semaphore
+    recording: bool
     waiting_for_openai: bool
     running: bool
 
@@ -403,11 +420,16 @@ class VoiceCoder:
         self.message_thread = Thread(target=self._message_thread_func, daemon=True)
         self.recorder_thread = Thread(target=self._recorder_thread_func, daemon=True)
         self.input_semaphore = Semaphore(0)
+        self.recorder_semaphore = Semaphore(0)
+        self.recording = False
         self.waiting_for_openai = False
         self.running = False
 
-        with open(self.filename, 'rt') as fp:
-            self.content = fp.read()
+        try:
+            with open(self.filename, 'rt') as fp:
+                self.content = fp.read()
+        except FileNotFoundError:
+            self.content = ''
 
         lexer_class = find_lexer_class_for_filename(filename, self.content)
         self.lexer = lexer_class() if lexer_class else None
@@ -441,10 +463,24 @@ class VoiceCoder:
                     print("message thread: quit", file=sys.stderr)
                     return
                 else:
-                    user_message = maybe_message
+                    message_data = maybe_message
 
                 self.waiting_for_openai = True
                 self.event_queue.put((EventType.REDRAW, ))
+
+                if message_data[0] == MessageType.VOICE:
+                    voice_data = message_data[1]
+
+                    self.event_queue.put((EventType.SET_MESSAGE, 'Processing voice message...', LEVEL_INFO))
+                    whisper_response = self.openai.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=("recording.wav", voice_data),
+                    )
+
+                    user_message = whisper_response.text
+                    self.event_queue.put((EventType.SET_MESSAGE, ':' + user_message, LEVEL_INFO))
+                else:
+                    user_message = message_data[1]
 
                 if self.lexer:
                     lang = self.lexer.name
@@ -457,7 +493,7 @@ class VoiceCoder:
                 # TODO: put all context data in event, don't touch self here
                 start_lineno = self.scroll_yoffset + 1
                 end_lineno = max(start_lineno + self.term_size.lines + 1, 0)
-                print("message thread: process", repr(user_message), file=sys.stderr)
+                print("message thread: processing", repr(user_message), file=sys.stderr)
                 content = self.content
                 response = self.openai.chat.completions.create(
                     model="gpt-4-1106-preview",
@@ -485,7 +521,6 @@ class VoiceCoder:
                 choice = response.choices[0]
                 bot_message = choice.message.content or ''
                 update_data = parse_content_update(bot_message, content, lang)
-                self.waiting_for_openai = False
 
                 print("message thread: parsed response:\n", update_data, file=sys.stderr)
 
@@ -494,10 +529,65 @@ class VoiceCoder:
                 print('message thread: error', exc, file=sys.stderr)
                 self.event_queue.put((EventType.SET_MESSAGE, str(exc), LEVEL_ERROR))
             finally:
-                print('message thread: finally', file=sys.stderr)
+                self.waiting_for_openai = False
 
     def _recorder_thread_func(self) -> None:
-        pass # TODO
+        samplerate = 44100
+        wavfile = io.BytesIO()
+
+        while self.running:
+            try:
+                self.recorder_semaphore.acquire()
+                self.recording = True
+                self.event_queue.put((EventType.REDRAW,))
+
+                chunks = []
+                stream = sounddevice.InputStream(samplerate, channels=1, dtype=np.int16)
+                stream.start()
+                try:
+                    #no = 1
+                    while self.running and self.recording:
+                        chunk, _was_discarded = stream.read(samplerate)
+                        # TODO: better silence detection
+                        if np.all(abs(chunk) < 6553):
+                            if chunks:
+                                data = np.concatenate(chunks)
+                                chunks.clear()
+                                wavfile.truncate(0)
+                                wavio.write(wavfile, data, samplerate, sampwidth=2)
+                                data = wavfile.getbuffer()
+
+                                #with open(f"/tmp/recording_{no:04d}.wav", "wb") as fp:
+                                #    fp.write(data)
+                                #no += 1
+
+                                self.message_queue.put((MessageType.VOICE, bytes(data)))
+                            #else:
+                            #    self.event_queue.put((EventType.SET_MESSAGE, 'Are you still there?', LEVEL_WARNING))
+                        else:
+                            chunks.append(chunk)
+
+                    if self.running:
+                        if chunks:
+                            data = np.concatenate(chunks)
+                            wavfile.truncate(0)
+                            wavio.write(wavfile, data, samplerate)
+                            data = wavfile.getbuffer()
+
+                            #with open(f"/tmp/recording_{no:04d}.wav", "wb") as fp:
+                            #    fp.write(data)
+                            #no += 1
+
+                            self.message_queue.put((MessageType.VOICE, bytes(data)))
+
+                        self.event_queue.put((EventType.SET_MESSAGE, 'Stopped recording', LEVEL_INFO))
+                finally:
+                    stream.stop()
+                    stream.close()
+
+            except Exception as exc:
+                print('recorder thread: error', exc, file=sys.stderr)
+                self.event_queue.put((EventType.SET_MESSAGE, str(exc), LEVEL_ERROR))
 
     @property
     def max_yoffset(self) -> int:
@@ -610,8 +700,10 @@ class VoiceCoder:
                     self.saved = True
                     self.set_message('Written to file: ' + self.filename)
             elif raw == b' ':
-                self.set_message("Please speak now...")
-                # TODO: record voice in a thread until space is pressed again
+                if self.recording:
+                    self.recording = False
+                else:
+                    self.recorder_semaphore.release()
             elif raw == b'\n':
                 self.clear_message()
             elif raw == b'z':
@@ -633,7 +725,7 @@ class VoiceCoder:
                             message = input('')
 
                         self.waiting_for_openai = True
-                        self.message_queue.put(message)
+                        self.message_queue.put((MessageType.TEXT, message))
 
                 except Exception as exc:
                     self.set_message(str(exc), LEVEL_ERROR)
@@ -682,6 +774,7 @@ class VoiceCoder:
         self.running = True
         self.input_thread.start()
         self.message_thread.start()
+        self.recorder_thread.start()
         self.input_semaphore.release()
 
         with UnbufferedInput():
@@ -728,6 +821,7 @@ class VoiceCoder:
                         self.set_message(str(exc), LEVEL_ERROR)
             finally:
                 self.running = False
+                self.recording = False
                 self.message_queue.put(None)
 
                 # show cursor
@@ -771,8 +865,11 @@ class VoiceCoder:
         lineno = scroll_yoffset + 1
         max_yoffset = scroll_yoffset + self.term_size.lines
         message = self.message
-        if not message and self.waiting_for_openai:
-            message = ['Waiting for OpenAI...']
+        if not message:
+            if self.waiting_for_openai:
+                message = ['Waiting for OpenAI...']
+            if self.recording:
+                message = ['Please speak now...']
         message_lines: list[str] = []
         if message and columns > 0:
             # wrapping message lines
