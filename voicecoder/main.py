@@ -4,19 +4,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from typing import Optional, BinaryIO, Union, NamedTuple
+from typing import Optional, BinaryIO, Union, NamedTuple, Literal
 
 import os
 import io
 import sys
 import optparse
 import termios
-import xdelta3
+# import xdelta3 # XXX: broken?
 # import sounddevice
 # import wavio
 
 from os import get_terminal_size
 from signal import signal, SIGWINCH, SIG_DFL
+from queue import Queue
+from threading import Thread, Semaphore
+from enum import Enum
 from openai import OpenAI
 from pygments import format as colorize
 from pygments.lexer import Lexer
@@ -66,6 +69,30 @@ HELP = """\
     Use Ctrl+HOME/Ctrl+END to jump to the start/end of the file.
 """
 
+InputData = tuple[Union[bytes, bytearray], Optional[tuple[int, int, list[int]]]]
+
+class ContentUpdate(NamedTuple):
+    code: Optional[str] = None
+    message: Optional[str] = None
+    message_level: int = LEVEL_INFO
+
+class EventType(Enum):
+    REDRAW = 0
+    INPUT = 1
+    CONTENT_UPDATE = 2
+    VOICE_COMMAND = 3
+    FUNC_CALL = 4
+    SET_MESSAGE = 5
+
+Event = Union[
+    tuple[Literal[EventType.REDRAW]],
+    tuple[Literal[EventType.INPUT], InputData],
+    tuple[Literal[EventType.CONTENT_UPDATE], ContentUpdate],
+    tuple[Literal[EventType.VOICE_COMMAND], str],
+    tuple[Literal[EventType.FUNC_CALL], str, list],
+    tuple[Literal[EventType.SET_MESSAGE], str, int],
+]
+
 class UnbufferedInput:
     __slots__ = 'old_attrs',
 
@@ -110,19 +137,40 @@ class EchoedInput:
         # hide cursor
         sys.stdout.write('\x1b[?25l')
 
-class Response(NamedTuple):
-    code: Optional[str] = None
-    message: Optional[str] = None
-    message_level: int = LEVEL_INFO
+REST_UNCHANGED_MARK = '... [The rest of the file remains unchanged] ...'
+HASH_COMMENT_REST_UNCHANGED_MARK = f'# {REST_UNCHANGED_MARK}'
+INLINE_C_COMMENT_REST_UNCHANGED_MARK = f'// {REST_UNCHANGED_MARK}'
+SQL_COMMENT_REST_UNCHANGED_MARK = f'-- {REST_UNCHANGED_MARK}'
+MULTILINE_C_COMMENT_REST_UNCHANGED_MARK = f'/* {REST_UNCHANGED_MARK} */'
+SGML_REST_UNCHANGED_MARK = f'<!-- {REST_UNCHANGED_MARK} -->'
 
-def parse_response(message: str) -> Response:
+REST_UNCHANGED_MARKS: dict[Optional[str], str] = {
+    'Python': HASH_COMMENT_REST_UNCHANGED_MARK,
+    'Python 2.x': HASH_COMMENT_REST_UNCHANGED_MARK,
+    'Ruby': HASH_COMMENT_REST_UNCHANGED_MARK,
+    'Bash': HASH_COMMENT_REST_UNCHANGED_MARK,
+    'C': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
+    'C++': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
+    'JavaScript': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
+    'TypeScript': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
+    'Java': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
+    'C#': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
+    'Rust': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
+    'Go': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
+    'XML': SGML_REST_UNCHANGED_MARK,
+    'HTML': SGML_REST_UNCHANGED_MARK,
+    'SGML': SGML_REST_UNCHANGED_MARK,
+    'SQL': SQL_COMMENT_REST_UNCHANGED_MARK,
+}
+
+def parse_content_update(message: str, old_content: str, lang: Optional[str]) -> ContentUpdate:
     index = 0 if message.startswith('```') else message.find('\n```')
     if index == -1:
-        return Response(message=message)
+        return ContentUpdate(message=message)
 
     start_index = message.find('\n', index)
     if start_index == -1:
-        return Response(message=message)
+        return ContentUpdate(message=message)
 
     start_index += 1
 
@@ -132,7 +180,7 @@ def parse_response(message: str) -> Response:
         if message.endswith('\n```'):
             end_index = len(message) - 3
         else:
-            return Response(message=message)
+            return ContentUpdate(message=message)
     else:
         end_index += 1
 
@@ -147,9 +195,46 @@ def parse_response(message: str) -> Response:
 
     code = message[start_index:end_index]
 
-    return Response(code=code, message=new_message or None)
+    # HACK: Try to handle when OpenAI is truncating the file marking with:
+    #       # ... [The rest of the file remains unchanged] ...
+    mark = REST_UNCHANGED_MARKS.get(lang, REST_UNCHANGED_MARK)
+    index = code.find(mark)
 
-def read_ansi(stdin: BinaryIO) -> tuple[Union[bytes, bytearray], Optional[tuple[int, int, list[int]]]]:
+    if index != -1 and not code[index:].strip():
+        new_code = code[:index].rstrip()
+        last_line_index = new_code.rfind('\n')
+        if last_line_index == -1:
+            last_line_index = 0
+        else:
+            last_line_index += 1
+        last_line = new_code[last_line_index:]
+        line_count = code.count('\n') + 1
+        index = find_mark_line(last_line, old_content, line_count)
+        if index >= 0:
+            code = new_code + '\n' + old_content[index:]
+
+            print('reconstructing truncated code', file=sys.stderr)
+
+    return ContentUpdate(code=code, message=new_message or None)
+
+def find_mark_line(mark_line: str, content: str, head_lines: int) -> int:
+    line_count = 0
+    prev = 0
+    while line_count < head_lines:
+        index = content.find('\n', prev)
+        if index < 0:
+            line = content[prev:]
+            if line == mark_line:
+                return prev
+            return -1
+        line = content[prev:index]
+        if line == mark_line:
+            return prev
+        prev = index + 1
+        line_count += 1
+    return -1
+
+def read_ansi(stdin: BinaryIO) -> InputData:
     byte = stdin.read(1)
     if not byte or byte[0] != 27:
         return byte, None
@@ -269,6 +354,8 @@ class VoiceCoder:
         'scroll_xoffset', 'scroll_yoffset', 'filename', 'stdin', 'term_size',
         'lexer', 'content', 'saved', 'lines', 'formatter', 'max_line_width',
         'message', 'message_level', 'openai', 'undo_history', 'redo_history',
+        'event_queue', 'input_thread', 'message_thread', 'recorder_thread',
+        'message_queue', 'input_semaphore', 'waiting_for_openai', 'running',
     )
 
     scroll_xoffset: int
@@ -285,15 +372,24 @@ class VoiceCoder:
     message: Optional[list[str]]
     message_level: int
     openai: OpenAI
-    undo_history: list[tuple[bytes, bytes]]
-    redo_history: list[tuple[bytes, bytes]]
+    # XXX: xdelta3 is broken?
+    #undo_history: list[tuple[Union[bytes, str], Union[bytes, str]]]
+    #redo_history: list[tuple[Union[bytes, str], Union[bytes, str]]]
+    undo_history: list[tuple[str, str]]
+    redo_history: list[tuple[str, str]]
+    event_queue: Queue[Event]
+    message_queue: Queue[Optional[str]]
+    input_thread: Thread
+    message_thread: Thread
+    recorder_thread: Thread
+    input_semaphore: Semaphore
+    waiting_for_openai: bool
+    running: bool
 
     def __init__(self, filename: str) -> None:
         self.scroll_xoffset = 0
         self.scroll_yoffset = 0
         self.filename = filename
-        lexer_class = find_lexer_class_for_filename(filename)
-        self.lexer = lexer_class() if lexer_class else None
         self.formatter = Terminal256Formatter()
         self.saved = True
         self.message = None
@@ -301,9 +397,20 @@ class VoiceCoder:
         self.openai = OpenAI()
         self.undo_history = []
         self.redo_history = []
+        self.event_queue = Queue()
+        self.message_queue = Queue()
+        self.input_thread = Thread(target=self._input_thread_func, daemon=True)
+        self.message_thread = Thread(target=self._message_thread_func, daemon=True)
+        self.recorder_thread = Thread(target=self._recorder_thread_func, daemon=True)
+        self.input_semaphore = Semaphore(0)
+        self.waiting_for_openai = False
+        self.running = False
 
         with open(self.filename, 'rt') as fp:
             self.content = fp.read()
+
+        lexer_class = find_lexer_class_for_filename(filename, self.content)
+        self.lexer = lexer_class() if lexer_class else None
 
         self.lines = tokenized_lines(self.content, self.lexer)
         self.max_line_width = max(
@@ -314,6 +421,84 @@ class VoiceCoder:
         self.stdin = io.open(sys.stdin.fileno(), 'rb', closefd=False, buffering=False)
         self.term_size = get_terminal_size()
 
+    def _input_thread_func(self) -> None:
+        while self.running:
+            try:
+                self.input_semaphore.acquire()
+                item = read_ansi(self.stdin)
+                self.event_queue.put((EventType.INPUT, item))
+            except KeyboardInterrupt:
+                pass
+            except Exception as exc:
+                print('input thread: error', exc, file=sys.stderr)
+                self.event_queue.put((EventType.SET_MESSAGE, str(exc), LEVEL_ERROR))
+
+    def _message_thread_func(self) -> None:
+        while self.running:
+            try:
+                maybe_message = self.message_queue.get()
+                if maybe_message is None:
+                    print("message thread: quit", file=sys.stderr)
+                    return
+                else:
+                    user_message = maybe_message
+
+                self.waiting_for_openai = True
+                self.event_queue.put((EventType.REDRAW, ))
+
+                if self.lexer:
+                    lang = self.lexer.name
+                    lang_name = lang + ' code'
+                else:
+                    lang = None
+                    lang_name = 'code'
+
+                # TODO: functions for saving, loading, scrolling etc.
+                # TODO: put all context data in event, don't touch self here
+                start_lineno = self.scroll_yoffset + 1
+                end_lineno = max(start_lineno + self.term_size.lines + 1, 0)
+                print("message thread: process", repr(user_message), file=sys.stderr)
+                content = self.content
+                response = self.openai.chat.completions.create(
+                    model="gpt-4-1106-preview",
+                    #model="gpt-3.5-turbo-16k",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": SYSTEM_MESSAGE_CONTENT.format(
+                                lang=lang_name,
+                                code=content,
+                                start_lineno=start_lineno,
+                                end_lineno=end_lineno,
+                                filename=self.filename,
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": user_message
+                        }
+                    ],
+                    max_tokens=MAX_TOKENS
+                )
+                print("message thread: response:\n", response, file=sys.stderr)
+
+                choice = response.choices[0]
+                bot_message = choice.message.content or ''
+                update_data = parse_content_update(bot_message, content, lang)
+                self.waiting_for_openai = False
+
+                print("message thread: parsed response:\n", update_data, file=sys.stderr)
+
+                self.event_queue.put((EventType.CONTENT_UPDATE, update_data))
+            except Exception as exc:
+                print('message thread: error', exc, file=sys.stderr)
+                self.event_queue.put((EventType.SET_MESSAGE, str(exc), LEVEL_ERROR))
+            finally:
+                print('message thread: finally', file=sys.stderr)
+
+    def _recorder_thread_func(self) -> None:
+        pass # TODO
+
     @property
     def max_yoffset(self) -> int:
         return max(len(self.lines) - self.term_size.lines, 0)
@@ -321,7 +506,7 @@ class VoiceCoder:
     @property
     def max_xoffset(self) -> int:
         return max(self.max_line_width - (self.term_size.columns - len(str(len(self.lines))) - 2), 0)
-    
+
     def clear_message(self) -> None:
         self.message = None
         self.message_level = LEVEL_INFO
@@ -352,10 +537,22 @@ class VoiceCoder:
             self.scroll_yoffset = max_yoffset
 
     def edit(self, new_content: str) -> None:
-        new_bytes = new_content.encode()
-        old_bytes = self.content.encode()
-        undo = xdelta3.encode(new_bytes, old_bytes)
-        redo = xdelta3.encode(old_bytes, new_bytes)
+        undo = self.content
+        redo = new_content
+
+        # XXX: xdelta is broken?
+        #new_bytes = new_content.encode()
+        #old_bytes = self.content.encode()
+        #try:
+        #    undo = xdelta3.encode(new_bytes, old_bytes)
+        #except xdelta3.NoDeltaFound:
+        #    undo = self.content
+
+        #try:
+        #    redo = xdelta3.encode(old_bytes, new_bytes)
+        #except xdelta3.NoDeltaFound:
+        #    redo = new_content
+
         self.undo_history.append((undo, redo))
         if len(self.undo_history) > MAX_UNDO_STEPS:
             del self.undo_history[0]
@@ -368,8 +565,12 @@ class VoiceCoder:
             item = self.undo_history.pop()
             undo, _redo = item
             content = self.content.encode()
-            new_content = xdelta3.decode(content, undo)
-            self.set_content(new_content.decode())
+            new_content = undo
+            #if isinstance(undo, str):
+            #    new_content = undo
+            #else:
+            #    new_content = xdelta3.decode(content, undo).decode()
+            self.set_content(new_content)
             self.redo_history.append(item)
         else:
             self.set_message('Already at oldest change', LEVEL_WARNING)
@@ -379,149 +580,156 @@ class VoiceCoder:
             item = self.redo_history.pop()
             _undo, redo = item
             content = self.content.encode()
-            new_content = xdelta3.decode(content, redo)
-            self.set_content(new_content.decode())
+            new_content = redo
+            #if isinstance(redo, str):
+            #    new_content = redo
+            #else:
+            #    new_content = xdelta3.decode(content, redo).decode()
+            self.set_content(new_content)
             self.undo_history.append(item)
         else:
             self.set_message('Already at newest change', LEVEL_WARNING)
 
+    def _handle_input(self, input_data: InputData) -> bool:
+        try:
+            #raw, decoded = read_ansi(self.stdin)
+            #print(raw, decoded)
+            raw, decoded = input_data
+
+            if raw == b'q':
+                # TODO: ask save
+                self.running = False
+                return False
+            elif raw == b'w':
+                try:
+                    with open(self.filename, 'w') as fp:
+                        fp.write(self.content)
+                except Exception as exc:
+                    self.set_message(str(exc), LEVEL_ERROR)
+                else:
+                    self.saved = True
+                    self.set_message('Written to file: ' + self.filename)
+            elif raw == b' ':
+                self.set_message("Please speak now...")
+                # TODO: record voice in a thread until space is pressed again
+            elif raw == b'\n':
+                self.clear_message()
+            elif raw == b'z':
+                self.undo()
+            elif raw == b'r':
+                self.redo()
+            elif raw == b'h':
+                self.set_message(HELP)
+            elif raw == b':':
+                try:
+                    if self.waiting_for_openai:
+                        self.set_message("Already wayting for an OpenAI action...", LEVEL_WARNING)
+                    else:
+                        # edit via text input
+                        sys.stdout.write('\x1b[%dE' % (self.term_size.lines))
+                        sys.stdout.write('\x1b[0K\r:')
+                        sys.stdout.flush()
+                        with EchoedInput():
+                            message = input('')
+
+                        self.waiting_for_openai = True
+                        self.message_queue.put(message)
+
+                except Exception as exc:
+                    self.set_message(str(exc), LEVEL_ERROR)
+            elif decoded:
+                prefix, suffix, args = decoded
+                if prefix == -1:
+                    if suffix == 65: # UP
+                        if self.scroll_yoffset > 0:
+                            self.scroll_yoffset -= 1
+                    elif suffix == 66: # DOWN
+                        self.scroll_yoffset = min(self.scroll_yoffset + 1, self.max_yoffset)
+                    elif suffix == 67: # RIGHT
+                        if self.scroll_xoffset < self.max_xoffset:
+                            self.scroll_xoffset += 1
+                    elif suffix == 68: # LEFT
+                        if self.scroll_xoffset > 0:
+                            self.scroll_xoffset -= 1
+                    elif suffix == 70: # END
+                        if args == CTRL: # CTRL+END
+                            self.scroll_yoffset = self.max_yoffset
+                        else:
+                            self.scroll_xoffset = self.max_xoffset
+                    elif suffix == 72: # HOME
+                        if args == CTRL: # CTRL+HOME
+                            self.scroll_yoffset = 0
+                        else:
+                            self.scroll_xoffset = 0
+                    elif decoded == PAGE_UP:
+                        self.scroll_yoffset = max(self.scroll_yoffset - self.term_size.lines, 0)
+                    elif decoded == PAGE_DOWN:
+                        self.scroll_yoffset = min(self.scroll_yoffset + self.term_size.lines, self.max_yoffset)
+                    else:
+                        self.show_unknown_shortcut()
+                else:
+                    self.show_unknown_shortcut()
+            else:
+                self.show_unknown_shortcut()
+        finally:
+            self.input_semaphore.release()
+
+        return True
+
     def start(self) -> None:
         signal(SIGWINCH, self._handle_sigwinch)
+
+        self.running = True
+        self.input_thread.start()
+        self.message_thread.start()
+        self.input_semaphore.release()
+
         with UnbufferedInput():
             try:
                 # hide cursor
                 sys.stdout.write('\x1b[?25l')
                 sys.stdout.flush()
 
-                while True:
+                while self.running:
                     try:
                         self.redraw()
-                        raw, decoded = read_ansi(self.stdin)
-                        #print(raw, decoded)
+                        event = self.event_queue.get()
 
-                        if raw == b'q':
-                            # TODO: ask save
-                            break
-                        elif raw == b'w':
-                            try:
-                                with open(self.filename, 'w') as fp:
-                                    fp.write(self.content)
-                            except Exception as exc:
-                                self.set_message(str(exc), LEVEL_ERROR)
+                        if event[0] == EventType.INPUT:
+                            if not self._handle_input(event[1]):
+                                break
+
+                        elif event[0] == EventType.REDRAW:
+                            self.redraw()
+
+                        elif event[0] == EventType.CONTENT_UPDATE:
+                            res = event[1]
+                            if res.message:
+                                self.set_message(res.message, res.message_level)
                             else:
-                                self.saved = True
-                                self.set_message('Written to file: ' + self.filename)
-                        elif raw == b' ':
-                            self.set_message("Please speak now...")
-                            # TODO: record voice in a thread until space is pressed again
-                        elif raw == b'\n':
-                            self.clear_message()
-                        elif raw == b'z':
-                            self.undo()
-                        elif raw == b'r':
-                            self.redo()
-                        elif raw == b'h':
-                            self.set_message(HELP)
-                        elif raw == b':':
-                            try:
-                                # edit via text input
-                                sys.stdout.write('\x1b[%dE' % (self.term_size.lines))
-                                sys.stdout.write('\x1b[0K\r')
-                                sys.stdout.flush()
-                                with EchoedInput():
-                                    text = input(':')
+                                self.clear_message()
 
-                                self.set_message("Wating for OpenAI...")
-                                self.redraw()
+                            new_content = res.code
+                            if new_content is not None:
+                                self.edit(new_content)
 
-                                if self.lexer:
-                                    lang = self.lexer.name + ' code'
-                                else:
-                                    lang = 'code'
+                        elif event[0] == EventType.FUNC_CALL:
+                            pass # TODO
 
-                                # TODO: functions for saving, loading, scrolling etc.
-                                # TODO: off-load this stuff to a thread
-                                start_lineno = self.scroll_yoffset + 1
-                                end_lineno = max(start_lineno + self.term_size.lines + 1, 0)
-                                response = self.openai.chat.completions.create(
-                                    model="gpt-4-1106-preview",
-                                    messages=[
-                                        {
-                                            "role": "system",
-                                            "content": SYSTEM_MESSAGE_CONTENT.format(
-                                                lang=lang,
-                                                code=self.content,
-                                                start_lineno=start_lineno,
-                                                end_lineno=end_lineno,
-                                                filename=self.filename,
-                                            )
-                                        },
-                                        {
-                                            "role": "user",
-                                            "content": text
-                                        }
-                                    ],
-                                    max_tokens=MAX_TOKENS
-                                )
+                        elif event[0] == EventType.VOICE_COMMAND:
+                            pass # TODO
 
-                                choice = response.choices[0]
-                                message = choice.message.content or ''
-                                res = parse_response(message)
+                        elif event[0] == EventType.SET_MESSAGE:
+                            self.set_message(event[1], event[2])
 
-                                if res.message:
-                                    self.set_message(res.message, res.message_level)
-                                else:
-                                    self.clear_message()
-
-                                new_content = res.code
-                                if new_content is not None:
-                                    self.edit(new_content)
-
-                                # DEBUG:
-                                #with open("/tmp/response.json", "w") as fp:
-                                #    fp.write(choice.message.json())
-
-                            except Exception as exc:
-                                self.set_message(str(exc), LEVEL_ERROR)
-                        elif decoded:
-                            prefix, suffix, args = decoded
-                            if prefix == -1:
-                                if suffix == 65: # UP
-                                    if self.scroll_yoffset > 0:
-                                        self.scroll_yoffset -= 1
-                                elif suffix == 66: # DOWN
-                                    self.scroll_yoffset = min(self.scroll_yoffset + 1, self.max_yoffset)
-                                elif suffix == 67: # RIGHT
-                                    if self.scroll_xoffset < self.max_xoffset:
-                                        self.scroll_xoffset += 1
-                                elif suffix == 68: # LEFT
-                                    if self.scroll_xoffset > 0:
-                                        self.scroll_xoffset -= 1
-                                elif suffix == 70: # END
-                                    if args == CTRL: # CTRL+END
-                                        self.scroll_yoffset = self.max_yoffset
-                                    else:
-                                        self.scroll_xoffset = self.max_xoffset
-                                elif suffix == 72: # HOME
-                                    if args == CTRL: # CTRL+HOME
-                                        self.scroll_yoffset = 0
-                                    else:
-                                        self.scroll_xoffset = 0
-                                elif decoded == PAGE_UP:
-                                    self.scroll_yoffset = max(self.scroll_yoffset - self.term_size.lines, 0)
-                                elif decoded == PAGE_DOWN:
-                                    self.scroll_yoffset = min(self.scroll_yoffset + self.term_size.lines, self.max_yoffset)
-                                else:
-                                    self.show_unknown_shortcut()
-                            else:
-                                self.show_unknown_shortcut()
-                        else:
-                            self.show_unknown_shortcut()
                     except KeyboardInterrupt:
                         self.set_message("Keyboard Interrrupt, use q for quit", LEVEL_WARNING)
                     except Exception as exc:
                         self.set_message(str(exc), LEVEL_ERROR)
             finally:
+                self.running = False
+                self.message_queue.put(None)
+
                 # show cursor
                 sys.stdout.write('\x1b[?25h')
                 sys.stdout.write('\n')
@@ -546,7 +754,7 @@ class VoiceCoder:
         if self.scroll_yoffset > max_yoffset:
             self.scroll_yoffset = max_yoffset
 
-        self.redraw()
+        self.event_queue.put((EventType.REDRAW, ))
 
     def redraw(self) -> None:
         columns = self.term_size.columns
@@ -563,8 +771,10 @@ class VoiceCoder:
         lineno = scroll_yoffset + 1
         max_yoffset = scroll_yoffset + self.term_size.lines
         message = self.message
+        if not message and self.waiting_for_openai:
+            message = ['Waiting for OpenAI...']
         message_lines: list[str] = []
-        if message is not None and columns > 0:
+        if message and columns > 0:
             # wrapping message lines
             for line in message:
                 w = wcswidth(line)
@@ -600,7 +810,7 @@ class VoiceCoder:
             if max_yoffset < 0:
                 max_yoffset = 0
 
-        max_lineno_len = len(str(max_yoffset))
+        max_lineno_len = len(str(len(self.lines) + 1))
         avail_columns = max(columns - max_lineno_len - 1, 0)
         for line in self.lines[scroll_yoffset:max_yoffset]:
             # line number color
@@ -628,11 +838,9 @@ class VoiceCoder:
                 sys.stdout.write('\x1b[31m')
 
             for line in message_lines:
-                sys.stdout.write('\n')
+                # clear to end of line and newline
+                sys.stdout.write('\x1b[0K\n')
                 sys.stdout.write(line)
-
-                # clear to end of line
-                sys.stdout.write('\x1b[0K')
 
             if self.message_level != LEVEL_INFO:
                 sys.stdout.write('\x1b[0m')
