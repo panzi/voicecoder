@@ -13,7 +13,8 @@ import optparse
 import termios
 # import xdelta3 # XXX: broken?
 import sounddevice
-import wavio
+#import wavio
+import lameenc
 import numpy as np
 
 from os import get_terminal_size
@@ -393,7 +394,7 @@ class VoiceCoder:
         'message', 'message_level', 'openai', 'undo_history', 'redo_history',
         'event_queue', 'input_thread', 'message_thread', 'recorder_thread',
         'message_queue', 'input_semaphore', 'waiting_for_openai', 'running',
-        'recorder_semaphore', 'recording',
+        'recorder_semaphore', 'recording', 'silence',
     )
 
     scroll_xoffset: int
@@ -425,6 +426,7 @@ class VoiceCoder:
     recording: bool
     waiting_for_openai: bool
     running: bool
+    silence: bool
 
     def __init__(self, filename: str) -> None:
         self.scroll_xoffset = 0
@@ -447,6 +449,7 @@ class VoiceCoder:
         self.recording = False
         self.waiting_for_openai = False
         self.running = False
+        self.silence = False
 
         try:
             with open(self.filename, 'rt') as fp:
@@ -479,6 +482,7 @@ class VoiceCoder:
                 self.event_queue.put((EventType.SET_MESSAGE, str(exc), LEVEL_ERROR))
 
     def _message_thread_func(self) -> None:
+        #recording_no = 1
         while self.running:
             try:
                 maybe_message = self.message_queue.get()
@@ -494,10 +498,23 @@ class VoiceCoder:
                 if message_data[0] == MessageType.VOICE:
                     voice_data = message_data[1]
 
+                    encoder = lameenc.Encoder()
+                    encoder.silence()
+                    encoder.set_bit_rate(128)
+                    encoder.set_in_sample_rate(44100)
+                    encoder.set_channels(1)
+                    encoder.set_quality(5)
+                    mp3_data = encoder.encode(voice_data)
+                    mp3_data += encoder.flush()
+
+                    #with open(f"/tmp/recording_{recording_no:04d}.mp3", "wb") as fp:
+                    #    fp.write(mp3_data)
+                    #recording_no += 1
+
                     self.event_queue.put((EventType.SET_MESSAGE, 'Processing voice message...', LEVEL_INFO))
                     whisper_response = self.openai.audio.transcriptions.create(
                         model="whisper-1",
-                        file=("recording.wav", voice_data),
+                        file=("recording.mp3", mp3_data),
                     )
 
                     user_message = whisper_response.text
@@ -568,7 +585,7 @@ class VoiceCoder:
 
     def _recorder_thread_func(self) -> None:
         samplerate = 44100
-        wavfile = io.BytesIO()
+        #wavfile = io.BytesIO()
 
         while self.running:
             try:
@@ -578,42 +595,55 @@ class VoiceCoder:
 
                 chunks = []
                 stream = sounddevice.InputStream(samplerate, channels=1, dtype=np.int16)
+                silence_treshold = int(~(-1 << (stream.samplesize * 8)) * 0.25 * 0.5) # type: ignore
                 stream.start()
                 try:
                     #no = 1
                     while self.running and self.recording:
                         chunk, _was_discarded = stream.read(samplerate)
                         # TODO: better silence detection
-                        if np.all(abs(chunk) < 6553):
+                        if np.all(abs(chunk) < silence_treshold):
+                            self.silence = True
+                            self.event_queue.put((EventType.REDRAW,))
                             if chunks:
                                 data = np.concatenate(chunks)
+                                if data.dtype.str != '<i2': # type: ignore
+                                    data = data.astype('<i2', copy=False) # type: ignore
+                                data = data.tobytes()
                                 chunks.clear()
-                                wavfile.truncate(0)
-                                wavio.write(wavfile, data, samplerate, sampwidth=2)
-                                data = wavfile.getbuffer()
+
+                                #wavfile.truncate(0)
+                                #wavio.write(wavfile, data, samplerate, sampwidth=2)
+                                #data = wavfile.getbuffer()
 
                                 #with open(f"/tmp/recording_{no:04d}.wav", "wb") as fp:
                                 #    fp.write(data)
                                 #no += 1
 
-                                self.message_queue.put((MessageType.VOICE, bytes(data)))
+                                self.message_queue.put((MessageType.VOICE, data))
                             #else:
                             #    self.event_queue.put((EventType.SET_MESSAGE, 'Are you still there?', LEVEL_WARNING))
                         else:
+                            self.silence = False
+                            self.event_queue.put((EventType.REDRAW,))
                             chunks.append(chunk)
 
+                    self.silence = True
                     if self.running:
                         if chunks:
                             data = np.concatenate(chunks)
-                            wavfile.truncate(0)
-                            wavio.write(wavfile, data, samplerate)
-                            data = wavfile.getbuffer()
+                            if data.dtype.str != '<i2': # type: ignore
+                                data = data.astype('<i2', copy=False) # type: ignore
+                            data = data.tobytes()
+                            #wavfile.truncate(0)
+                            #wavio.write(wavfile, data, samplerate)
+                            #data = wavfile.getbuffer()
 
                             #with open(f"/tmp/recording_{no:04d}.wav", "wb") as fp:
                             #    fp.write(data)
                             #no += 1
 
-                            self.message_queue.put((MessageType.VOICE, bytes(data)))
+                            self.message_queue.put((MessageType.VOICE, data))
 
                         self.event_queue.put((EventType.SET_MESSAGE, 'Stopped recording', LEVEL_INFO))
                 finally:
@@ -938,7 +968,10 @@ class VoiceCoder:
             if self.waiting_for_openai:
                 message = ['Waiting for OpenAI...']
             if self.recording:
-                message = ['Please speak now...']
+                if self.silence:
+                    message = ['Please speak now... (silence)']
+                else:
+                    message = ['Please speak now...']
         message_lines: list[str] = []
         if message and columns > 0:
             # wrapping message lines

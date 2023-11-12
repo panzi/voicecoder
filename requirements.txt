@@ -8,3 +8,6 @@ python-dotenv==1.0.0
 #xdelta3==0.0.5
 pydantic==2.4.2
 numpy==1.26.1
+#PyOgg==0.6.14a1
+lameenc==1.6.3
+
