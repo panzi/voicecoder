@@ -31,7 +31,7 @@ from openai._types import NOT_GIVEN
 from pygments import format as colorize
 from pygments.lexer import Lexer
 from pygments.token import _TokenType, Token
-from pygments.lexers import find_lexer_class_for_filename
+from pygments.lexers import TextLexer, find_lexer_class_for_filename
 from pygments.formatter import Formatter
 from pygments.formatters import TerminalFormatter
 from wcwidth import wcswidth
@@ -57,6 +57,7 @@ except ImportError:
 else:
     readline.parse_and_bind('tab: complete')
 
+DEFAULT_SAMPLERATE = 44100
 DEFAULT_LEVEL = 'INFO'
 APP_DATA_DIR = get_app_data_dir()
 DEFAULT_LOGFILE = join_path(APP_DATA_DIR, 'session.log')
@@ -353,8 +354,9 @@ def tokenized_lines(content: str, lexer: Optional[Lexer]) -> list[list[tuple[_To
     if lexer:
         line: list[tuple[_TokenType, str]] = []
         lines: list[list[tuple[_TokenType, str]]] = [line]
+
         for tok_type, tok_data in lexer.get_tokens(content):
-            if tok_type is Token.Text and tok_data == '\n':
+            if (tok_type is Token.Text or tok_type is Token.Whitespace) and tok_data == '\n':
                 line = []
                 lines.append(line)
             else:
@@ -373,6 +375,9 @@ def tokenized_lines(content: str, lexer: Optional[Lexer]) -> list[list[tuple[_To
                     lines.append(line)
 
                     prev = index + 1
+
+        if lines and not lines[-1]:
+            lines.pop()
     else:
         lines = [[(Token.Text, line)] for line in content.split('\n')]
     return lines
@@ -419,7 +424,7 @@ class VoiceCoder:
         'message_queue', 'input_semaphore', 'waiting_for_openai', 'running',
         'recorder_semaphore', 'recording', 'silence', 'log_voice',
         'voicelog_dir', 'message_log', 'log_messages', 'voice_lang',
-        'sound_device',
+        'sound_device', 'samplerate',
     )
 
     scroll_xoffset: int
@@ -458,8 +463,9 @@ class VoiceCoder:
     voicelog_dir: str
     voice_lang: Optional[str]
     sound_device: Optional[str]
+    samplerate: int
 
-    def __init__(self, filename: str, log_voice: bool = False, log_messages: bool = False, voice_lang: Optional[str] = None, sound_device: Optional[str] = None) -> None:
+    def __init__(self, filename: str, log_voice: bool = False, log_messages: bool = False, voice_lang: Optional[str] = None, sound_device: Optional[str] = None, samplerate: int = DEFAULT_SAMPLERATE) -> None:
         self.scroll_xoffset = 0
         self.scroll_yoffset = 0
         self.filename = filename
@@ -486,6 +492,7 @@ class VoiceCoder:
         self.voicelog_dir = join_path(APP_DATA_DIR, 'voicelog')
         self.voice_lang = voice_lang
         self.sound_device = sound_device
+        self.samplerate = samplerate
 
         self.open_file(self.filename)
 
@@ -502,7 +509,10 @@ class VoiceCoder:
         self.filename = filename
 
         lexer_class = find_lexer_class_for_filename(filename, self.content)
-        self.lexer = lexer_class() if lexer_class else None
+        if lexer_class is TextLexer or lexer_class is None:
+            self.lexer = None
+        else:
+            self.lexer = lexer_class()
 
         self.lines = tokenized_lines(self.content, self.lexer)
         self.max_line_width = max(
@@ -527,7 +537,7 @@ class VoiceCoder:
         while self.running:
             try:
                 maybe_message = self.message_queue.get()
-                if maybe_message is None:
+                if maybe_message is None or not self.running:
                     logger.debug("message thread: quit")
                     return
                 else:
@@ -544,7 +554,7 @@ class VoiceCoder:
                     encoder = lameenc.Encoder()
                     encoder.silence()
                     encoder.set_bit_rate(128)
-                    encoder.set_in_sample_rate(44100)
+                    encoder.set_in_sample_rate(self.samplerate)
                     encoder.set_channels(1)
                     encoder.set_quality(5)
                     mp3_data = encoder.encode(voice_data)
@@ -660,7 +670,6 @@ class VoiceCoder:
                 self.event_queue.put((EventType.REDRAW, ))
 
     def _recorder_thread_func(self) -> None:
-        samplerate = 44100
         #wavfile = io.BytesIO()
 
         while self.running:
@@ -670,13 +679,13 @@ class VoiceCoder:
                 self.event_queue.put((EventType.REDRAW,))
 
                 chunks = []
-                stream = sounddevice.InputStream(samplerate, channels=1, dtype=np.int16, device=self.sound_device)
+                stream = sounddevice.InputStream(self.samplerate, channels=1, dtype=np.int16, device=self.sound_device)
                 silence_treshold = int(~(-1 << (stream.samplesize * 8)) * 0.25 * 0.5) # type: ignore
                 stream.start()
                 try:
                     #no = 1
                     while self.running and self.recording:
-                        chunk, _was_discarded = stream.read(samplerate)
+                        chunk, _was_discarded = stream.read(self.samplerate)
                         # TODO: better silence detection
                         if np.all(abs(chunk) < silence_treshold):
                             self.silence = True
@@ -689,7 +698,7 @@ class VoiceCoder:
                                 chunks.clear()
 
                                 #wavfile.truncate(0)
-                                #wavio.write(wavfile, data, samplerate, sampwidth=2)
+                                #wavio.write(wavfile, data, self.samplerate, sampwidth=2)
                                 #data = wavfile.getbuffer()
 
                                 #with open(f"/tmp/recording_{no:04d}.wav", "wb") as fp:
@@ -712,7 +721,7 @@ class VoiceCoder:
                                 data = data.astype('<i2', copy=False) # type: ignore
                             data = data.tobytes()
                             #wavfile.truncate(0)
-                            #wavio.write(wavfile, data, samplerate)
+                            #wavio.write(wavfile, data, self.samplerate)
                             #data = wavfile.getbuffer()
 
                             #with open(f"/tmp/recording_{no:04d}.wav", "wb") as fp:
@@ -1121,14 +1130,14 @@ class VoiceCoder:
                                 break
 
                         message_lines.append(line[start_index:end_index])
-                        max_yoffset -= 1
                         prev = next_prev
                 else:
                     message_lines.append(line)
-                    max_yoffset -= 1
 
-            if max_yoffset < 0:
-                max_yoffset = 0
+            max_yoffset -= len(message_lines)
+
+            if max_yoffset < scroll_yoffset:
+                max_yoffset = scroll_yoffset
 
         max_lineno_len = len(str(len(self.lines) + 1))
         avail_columns = max(columns - max_lineno_len - 1, 0)
@@ -1189,10 +1198,15 @@ def main() -> None:
     optparser.add_option('--log-messages', action='store_true', default=False)
     optparser.add_option('--voice-lang', metavar='LANG', default=None, help='ISO-639-1 two-letter language code for voice input')
     optparser.add_option('--sound-device', metavar='DEVICE_ID', default=None)
+    optparser.add_option('--samplerate', type=int, default=DEFAULT_SAMPLERATE, help=f'default: {DEFAULT_SAMPLERATE}')
     opts, args = optparser.parse_args()
 
     if len(args) != 1:
         raise ValueError("expected exactly one file argument")
+
+    if opts.samplerate <= 0:
+        print(f'illegal sample rate: {opts.samplerate}', file=sys.stderr)
+        sys.exit(1)
 
     logfile: str = opts.log_file
     logdir = dirname(logfile)
@@ -1210,6 +1224,7 @@ def main() -> None:
         log_messages=opts.log_messages,
         voice_lang=opts.voice_lang,
         sound_device=opts.sound_device,
+        samplerate=opts.samplerate,
     )
     coder.start()
 
