@@ -419,6 +419,7 @@ class VoiceCoder:
         'message_queue', 'input_semaphore', 'waiting_for_openai', 'running',
         'recorder_semaphore', 'recording', 'silence', 'log_voice',
         'voicelog_dir', 'message_log', 'log_messages', 'voice_lang',
+        'sound_device',
     )
 
     scroll_xoffset: int
@@ -456,8 +457,9 @@ class VoiceCoder:
     log_messages: bool
     voicelog_dir: str
     voice_lang: Optional[str]
+    sound_device: Optional[str]
 
-    def __init__(self, filename: str, log_voice: bool = False, log_messages: bool = False, voice_lang: Optional[str] = None) -> None:
+    def __init__(self, filename: str, log_voice: bool = False, log_messages: bool = False, voice_lang: Optional[str] = None, sound_device: Optional[str] = None) -> None:
         self.scroll_xoffset = 0
         self.scroll_yoffset = 0
         self.filename = filename
@@ -483,6 +485,7 @@ class VoiceCoder:
         self.log_messages = log_messages
         self.voicelog_dir = join_path(APP_DATA_DIR, 'voicelog')
         self.voice_lang = voice_lang
+        self.sound_device = sound_device
 
         self.open_file(self.filename)
 
@@ -667,7 +670,7 @@ class VoiceCoder:
                 self.event_queue.put((EventType.REDRAW,))
 
                 chunks = []
-                stream = sounddevice.InputStream(samplerate, channels=1, dtype=np.int16)
+                stream = sounddevice.InputStream(samplerate, channels=1, dtype=np.int16, device=self.sound_device)
                 silence_treshold = int(~(-1 << (stream.samplesize * 8)) * 0.25 * 0.5) # type: ignore
                 stream.start()
                 try:
@@ -1185,6 +1188,7 @@ def main() -> None:
     optparser.add_option('--log-voice', action='store_true', default=False)
     optparser.add_option('--log-messages', action='store_true', default=False)
     optparser.add_option('--voice-lang', metavar='LANG', default=None, help='ISO-639-1 two-letter language code for voice input')
+    optparser.add_option('--sound-device', metavar='DEVICE_ID', default=None)
     opts, args = optparser.parse_args()
 
     if len(args) != 1:
@@ -1205,6 +1209,7 @@ def main() -> None:
         log_voice=opts.log_voice,
         log_messages=opts.log_messages,
         voice_lang=opts.voice_lang,
+        sound_device=opts.sound_device,
     )
     coder.start()
 
