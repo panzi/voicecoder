@@ -25,6 +25,7 @@ from signal import signal, SIGWINCH, SIG_DFL
 from queue import Queue
 from threading import Thread, Semaphore
 from enum import Enum
+from datetime import datetime
 from openai import OpenAI
 from pygments import format as colorize
 from pygments.lexer import Lexer
@@ -52,6 +53,10 @@ except ImportError:
     pass
 else:
     readline.parse_and_bind('tab: complete')
+
+DEFAULT_LEVEL = 'INFO'
+APP_DATA_DIR = get_app_data_dir()
+DEFAULT_LOGFILE = join_path(APP_DATA_DIR, 'session.log')
 
 CTRL = [1, 5]
 PAGE_UP = (-1, 126, [5])
@@ -408,7 +413,7 @@ class VoiceCoder:
         'message', 'message_level', 'openai', 'undo_history', 'redo_history',
         'event_queue', 'input_thread', 'message_thread', 'recorder_thread',
         'message_queue', 'input_semaphore', 'waiting_for_openai', 'running',
-        'recorder_semaphore', 'recording', 'silence',
+        'recorder_semaphore', 'recording', 'silence', 'log_voice',
     )
 
     scroll_xoffset: int
@@ -441,8 +446,9 @@ class VoiceCoder:
     waiting_for_openai: bool
     running: bool
     silence: bool
+    log_voice: bool
 
-    def __init__(self, filename: str) -> None:
+    def __init__(self, filename: str, log_voice: bool = False) -> None:
         self.scroll_xoffset = 0
         self.scroll_yoffset = 0
         self.filename = filename
@@ -464,6 +470,7 @@ class VoiceCoder:
         self.waiting_for_openai = False
         self.running = False
         self.silence = False
+        self.log_voice = log_voice
 
         try:
             with open(self.filename, 'rt') as fp:
@@ -521,6 +528,23 @@ class VoiceCoder:
                     encoder.set_quality(5)
                     mp3_data = encoder.encode(voice_data)
                     mp3_data += encoder.flush()
+
+                    if self.log_voice:
+                        try:
+                            logdir = join_path(APP_DATA_DIR, 'voicelog')
+                            now = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+                            mp3_filename = join_path(logdir, now + '.mp3')
+
+                            try:
+                                with open(mp3_filename, "wb") as fp:
+                                    fp.write(mp3_data)
+                            except FileNotFoundError:
+                                os.makedirs(logdir, exist_ok=True)
+
+                                with open(mp3_filename, "wb") as fp:
+                                    fp.write(mp3_data)
+                        except Exception as exc:
+                            logging.error('saving voice log error:', exc_info=exc)
 
                     #with open(f"/tmp/recording_{recording_no:04d}.mp3", "wb") as fp:
                     #    fp.write(mp3_data)
@@ -1086,10 +1110,12 @@ class VoiceCoder:
 
         # clear to end of screen
         sys.stdout.write('\x1b[0J')
-        sys.stdout.flush()
+        if self.recording:
+            line = self.term_size.lines
+            column = max(self.term_size.columns - 1, 1)
+            sys.stdout.write(f'\x1b[{line};{column}H🎙️')
 
-DEFAULT_LEVEL = 'INFO'
-DEFAULT_LOGFILE = join_path(get_app_data_dir(), 'session.log')
+        sys.stdout.flush()
 
 def main() -> None:
     log_levels = ['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG']
@@ -1097,6 +1123,7 @@ def main() -> None:
     optparser = optparse.OptionParser()
     optparser.add_option('--log-file', default=DEFAULT_LOGFILE, metavar='PATH', help=f"default: {DEFAULT_LOGFILE}")
     optparser.add_option('--log-level', choices=log_levels, default=DEFAULT_LEVEL, metavar='LEVEL', help=f"One of: {', '.join(log_levels)}. default: {DEFAULT_LEVEL}")
+    optparser.add_option('--log-voice', action='store_true', default=False)
     opts, args = optparser.parse_args()
 
     if len(args) != 1:
@@ -1112,7 +1139,7 @@ def main() -> None:
     )
 
     filename = args[0]
-    coder = VoiceCoder(filename)
+    coder = VoiceCoder(filename, log_voice=opts.log_voice)
     coder.start()
 
 if __name__ == '__main__':
