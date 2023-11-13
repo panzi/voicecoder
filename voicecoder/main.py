@@ -685,7 +685,8 @@ class VoiceCoder:
                 try:
                     #no = 1
                     while self.running and self.recording:
-                        chunk, _was_discarded = stream.read(self.samplerate)
+                        # record for 2 seconds, i.e. 2 seconds silence is needed for input end
+                        chunk, _was_discarded = stream.read(self.samplerate * 2)
                         # TODO: better silence detection
                         if np.all(abs(chunk) < silence_treshold):
                             self.silence = True
