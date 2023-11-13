@@ -7,9 +7,12 @@ Experiments with OpenAI and Python to edit code via voice input.
 
 **Note:** This sends your code and voice recording to OpenAI!
 
-This is meant for people that can't use their hands. It kinda breaks down for
-large files. Then ChatGPT might only return the changed part, but not in a
-way that can be automatically applied.
+This is meant for people that can't use their hands. You can dictate code
+without being precise about all the special characters and such, basically
+dictate as you would to a human.
+
+It kinda breaks down for large files, though. Then ChatGPT might only
+return the changed part, but not in a way that can be automatically applied.
 
 You need to set the environment variable `OPENAI_API_KEY` to a valid value.
 It can be provided via a `.env` file in the current directory.
