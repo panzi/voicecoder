@@ -11,6 +11,8 @@ import io
 import sys
 import optparse
 import termios
+import platform
+import logging
 # import xdelta3 # XXX: broken?
 import sounddevice
 #import wavio
@@ -18,6 +20,7 @@ import lameenc
 import numpy as np
 
 from os import get_terminal_size
+from os.path import join as join_path, expanduser, dirname
 from signal import signal, SIGWINCH, SIG_DFL
 from queue import Queue
 from threading import Thread, Semaphore
@@ -31,6 +34,17 @@ from pygments.formatter import Formatter
 from pygments.formatters import Terminal256Formatter
 from wcwidth import wcswidth
 #from pydantic import BaseModel
+
+if platform.system() == 'Windows':
+    def get_app_data_dir() -> str:
+        appdata_dir = os.getenv('LOCALAPPDATA')
+        if appdata_dir is None:
+            appdata_dir = expanduser('~\\AppData\\Local')
+
+        return join_path(appdata_dir, 'VoiceCoder')
+else:
+    def get_app_data_dir() -> str:
+        return join_path(expanduser('~'), '.local', 'voicecoder')
 
 try:
     import readline
@@ -251,7 +265,7 @@ def parse_content_update(message: str, old_content: str, lang: Optional[str]) ->
         if index >= 0:
             code = new_code + '\n' + old_content[index:]
 
-            #print('reconstructing truncated code', file=sys.stderr)
+            logging.debug('reconstructing truncated code')
 
     return ContentUpdate(code=code, message=new_message or None)
 
@@ -473,13 +487,14 @@ class VoiceCoder:
         while self.running:
             try:
                 self.input_semaphore.acquire()
-                item = read_ansi(self.stdin)
-                self.event_queue.put((EventType.INPUT, item))
+                if self.running:
+                    item = read_ansi(self.stdin)
+                    self.event_queue.put((EventType.INPUT, item))
             except KeyboardInterrupt:
                 pass
             except Exception as exc:
-                #print('input thread: error', exc, file=sys.stderr)
-                self.event_queue.put((EventType.SET_MESSAGE, str(exc), LEVEL_ERROR))
+                logging.error('input thread error:', exc_info=exc)
+                self.event_queue.put((EventType.SET_MESSAGE, f'input error: {exc}', LEVEL_ERROR))
 
     def _message_thread_func(self) -> None:
         #recording_no = 1
@@ -514,13 +529,17 @@ class VoiceCoder:
                     self.event_queue.put((EventType.SET_MESSAGE, 'Processing voice message...', LEVEL_INFO))
                     whisper_response = self.openai.audio.transcriptions.create(
                         model="whisper-1",
-                        file=("recording.mp3", mp3_data),
+                        file=("recording.mp3", io.BytesIO(mp3_data), 'audio/mpeg'),
                     )
 
                     user_message = whisper_response.text
-                    self.event_queue.put((EventType.SET_MESSAGE, ':' + user_message, LEVEL_INFO))
+                    if user_message:
+                        self.event_queue.put((EventType.SET_MESSAGE, ':' + user_message, LEVEL_INFO))
                 else:
                     user_message = message_data[1]
+
+                if not user_message:
+                    continue
 
                 if self.lexer:
                     lang = self.lexer.name
@@ -533,7 +552,7 @@ class VoiceCoder:
                 # TODO: put all context data in event, don't touch self here
                 start_lineno = self.scroll_yoffset + 1
                 end_lineno = max(start_lineno + self.term_size.lines + 1, 0)
-                #print("message thread: processing", repr(user_message), file=sys.stderr)
+                logging.debug(f"sending message: {user_message!r}")
                 content = self.content
                 response = self.openai.chat.completions.create(
                     model="gpt-4-1106-preview",
@@ -574,12 +593,12 @@ class VoiceCoder:
                 bot_message = choice.message.content or ''
                 update_data = parse_content_update(bot_message, content, lang)
 
-                #print("message thread: parsed response:\n", update_data, file=sys.stderr)
+                logging.debug(f"message thread: parsed response:\n {update_data}")
 
                 self.event_queue.put((EventType.CONTENT_UPDATE, update_data))
             except Exception as exc:
-                #print('message thread: error', exc, file=sys.stderr)
-                self.event_queue.put((EventType.SET_MESSAGE, str(exc), LEVEL_ERROR))
+                logging.error('message thread error:', exc_info=exc)
+                self.event_queue.put((EventType.SET_MESSAGE, f'OpenAI error: {exc}', LEVEL_ERROR))
             finally:
                 self.waiting_for_openai = False
 
@@ -651,8 +670,8 @@ class VoiceCoder:
                     stream.close()
 
             except Exception as exc:
-                #print('recorder thread: error', exc, file=sys.stderr)
-                self.event_queue.put((EventType.SET_MESSAGE, str(exc), LEVEL_ERROR))
+                logging.error('recorder thread error:', exc_info=exc)
+                self.event_queue.put((EventType.SET_MESSAGE, f'recording error: {exc}', LEVEL_ERROR))
 
     @property
     def max_yoffset(self) -> int:
@@ -757,7 +776,8 @@ class VoiceCoder:
             with open(self.filename, 'w') as fp:
                 fp.write(self.content)
         except Exception as exc:
-            self.set_message(str(exc), LEVEL_ERROR)
+            logging.error('Error saving file:', exc_info=exc)
+            self.set_message(f'Error saving file: {exc}', LEVEL_ERROR)
         else:
             self.saved = True
             self.set_message('Written to file: ' + self.filename)
@@ -826,7 +846,8 @@ class VoiceCoder:
                             self.message_queue.put((MessageType.TEXT, message))
 
                 except Exception as exc:
-                    self.set_message(str(exc), LEVEL_ERROR)
+                    logging.error('Error processing message:', exc_info=exc)
+                    self.set_message(f'Error processing message: {exc}', LEVEL_ERROR)
             elif decoded:
                 prefix, suffix, args = decoded
                 if prefix == -1:
@@ -916,18 +937,32 @@ class VoiceCoder:
                     except KeyboardInterrupt:
                         self.set_message("Keyboard Interrrupt, use q for quit", LEVEL_WARNING)
                     except Exception as exc:
+                        logging.error("error in event loop:", exc_info=exc)
                         self.set_message(str(exc), LEVEL_ERROR)
+
+                self.set_message("Exiting...")
+                self.redraw()
             finally:
-                self.running = False
-                self.recording = False
-                self.message_queue.put(None)
+                try:
+                    self.running = False
+                    self.recording = False
+                    self.message_queue.put(None)
+                    self.input_semaphore.release()
+                    self.recorder_semaphore.release()
 
-                # show cursor
-                sys.stdout.write('\x1b[?25h')
-                sys.stdout.write('\n')
-                sys.stdout.flush()
+                    self.input_thread.join()
+                    self.message_thread.join()
+                    self.recorder_thread.join()
 
-                signal(SIGWINCH, SIG_DFL)
+                except Exception as exc:
+                    logging.error("error while exiting:", exc_info=exc)
+                finally:
+                    # show cursor
+                    sys.stdout.write('\x1b[?25h')
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+
+                    signal(SIGWINCH, SIG_DFL)
 
     def __enter__(self) -> None:
         pass
@@ -1053,12 +1088,28 @@ class VoiceCoder:
         sys.stdout.write('\x1b[0J')
         sys.stdout.flush()
 
+DEFAULT_LEVEL = 'INFO'
+DEFAULT_LOGFILE = join_path(get_app_data_dir(), 'session.log')
+
 def main() -> None:
+    log_levels = ['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG']
+
     optparser = optparse.OptionParser()
+    optparser.add_option('--log-file', default=DEFAULT_LOGFILE, metavar='PATH', help=f"default: {DEFAULT_LOGFILE}")
+    optparser.add_option('--log-level', choices=log_levels, default=DEFAULT_LEVEL, metavar='LEVEL', help=f"One of: {', '.join(log_levels)}. default: {DEFAULT_LEVEL}")
     opts, args = optparser.parse_args()
 
     if len(args) != 1:
         raise ValueError("expected exactly one file argument")
+
+    logfile: str = opts.log_file
+    logdir = dirname(logfile)
+    os.makedirs(logdir, exist_ok=True)
+
+    logging.basicConfig(
+        filename=logfile,
+        level=opts.log_level,
+    )
 
     filename = args[0]
     coder = VoiceCoder(filename)
