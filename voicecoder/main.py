@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from typing import Optional, BinaryIO, Union, NamedTuple, Literal
+from typing import Optional, BinaryIO, TextIO, Union, NamedTuple, Literal
 
 import os
 import io
@@ -27,14 +27,17 @@ from threading import Thread, Semaphore
 from enum import Enum
 from datetime import datetime
 from openai import OpenAI
+from openai._types import NOT_GIVEN
 from pygments import format as colorize
 from pygments.lexer import Lexer
 from pygments.token import _TokenType, Token
 from pygments.lexers import find_lexer_class_for_filename
 from pygments.formatter import Formatter
-from pygments.formatters import Terminal256Formatter
+from pygments.formatters import TerminalFormatter
 from wcwidth import wcswidth
 #from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 if platform.system() == 'Windows':
     def get_app_data_dir() -> str:
@@ -87,9 +90,10 @@ HELP = """\
     h ......... show this help message
     w ......... write file (save)
     W ......... write to new file (save as)
+    e ......... edit a new file (open)
     <SPACE> ... start voice recording
     : ......... enter command via typing
-    z ......... undo
+    u ......... undo
     r ......... redo
     <ENTER> ... clear message
     q ......... quit
@@ -107,20 +111,20 @@ class ContentUpdate(NamedTuple):
     message_level: int = LEVEL_INFO
 
 class EventType(Enum):
-    REDRAW = 0
-    INPUT = 1
+    REDRAW         = 0
+    INPUT          = 1
     CONTENT_UPDATE = 2
-    VOICE_COMMAND = 3
-    FUNC_CALL = 4
-    SET_MESSAGE = 5
+    FUNC_CALL      = 3
+    SET_MESSAGE    = 4
+    CLEAR_MESSAGE  = 5
 
 Event = Union[
     tuple[Literal[EventType.REDRAW]],
     tuple[Literal[EventType.INPUT], InputData],
     tuple[Literal[EventType.CONTENT_UPDATE], ContentUpdate],
-    tuple[Literal[EventType.VOICE_COMMAND], str],
     tuple[Literal[EventType.FUNC_CALL], str, list],
     tuple[Literal[EventType.SET_MESSAGE], str, int],
+    tuple[Literal[EventType.CLEAR_MESSAGE]],
 ]
 
 class MessageType(Enum):
@@ -270,7 +274,7 @@ def parse_content_update(message: str, old_content: str, lang: Optional[str]) ->
         if index >= 0:
             code = new_code + '\n' + old_content[index:]
 
-            logging.debug('reconstructing truncated code')
+            logger.info('reconstructing truncated code')
 
     return ContentUpdate(code=code, message=new_message or None)
 
@@ -414,12 +418,14 @@ class VoiceCoder:
         'event_queue', 'input_thread', 'message_thread', 'recorder_thread',
         'message_queue', 'input_semaphore', 'waiting_for_openai', 'running',
         'recorder_semaphore', 'recording', 'silence', 'log_voice',
+        'voicelog_dir', 'message_log', 'log_messages', 'voice_lang',
     )
 
     scroll_xoffset: int
     scroll_yoffset: int
     filename: str
     stdin: BinaryIO
+    message_log: Optional[TextIO]
     term_size: os.terminal_size
     lexer: Optional[Lexer]
     formatter: Formatter
@@ -447,12 +453,15 @@ class VoiceCoder:
     running: bool
     silence: bool
     log_voice: bool
+    log_messages: bool
+    voicelog_dir: str
+    voice_lang: Optional[str]
 
-    def __init__(self, filename: str, log_voice: bool = False) -> None:
+    def __init__(self, filename: str, log_voice: bool = False, log_messages: bool = False, voice_lang: Optional[str] = None) -> None:
         self.scroll_xoffset = 0
         self.scroll_yoffset = 0
         self.filename = filename
-        self.formatter = Terminal256Formatter()
+        self.formatter = TerminalFormatter()
         self.saved = True
         self.message = None
         self.message_level = LEVEL_INFO
@@ -471,12 +480,23 @@ class VoiceCoder:
         self.running = False
         self.silence = False
         self.log_voice = log_voice
+        self.log_messages = log_messages
+        self.voicelog_dir = join_path(APP_DATA_DIR, 'voicelog')
+        self.voice_lang = voice_lang
 
+        self.open_file(self.filename)
+
+        self.stdin = io.open(sys.stdin.fileno(), 'rb', closefd=False, buffering=False)
+        self.term_size = get_terminal_size()
+
+    def open_file(self, filename: str) -> None:
         try:
-            with open(self.filename, 'rt') as fp:
+            with open(filename, 'rt') as fp:
                 self.content = fp.read()
         except FileNotFoundError:
             self.content = ''
+
+        self.filename = filename
 
         lexer_class = find_lexer_class_for_filename(filename, self.content)
         self.lexer = lexer_class() if lexer_class else None
@@ -486,9 +506,6 @@ class VoiceCoder:
             wcswidth(''.join(tok_data for _, tok_data in line))
             for line in self.lines
         )
-
-        self.stdin = io.open(sys.stdin.fileno(), 'rb', closefd=False, buffering=False)
-        self.term_size = get_terminal_size()
 
     def _input_thread_func(self) -> None:
         while self.running:
@@ -500,22 +517,23 @@ class VoiceCoder:
             except KeyboardInterrupt:
                 pass
             except Exception as exc:
-                logging.error('input thread error:', exc_info=exc)
+                logger.error('input thread error:', exc_info=exc)
                 self.event_queue.put((EventType.SET_MESSAGE, f'input error: {exc}', LEVEL_ERROR))
 
     def _message_thread_func(self) -> None:
-        #recording_no = 1
         while self.running:
             try:
                 maybe_message = self.message_queue.get()
                 if maybe_message is None:
-                    #print("message thread: quit", file=sys.stderr)
+                    logger.debug("message thread: quit")
                     return
                 else:
                     message_data = maybe_message
 
                 self.waiting_for_openai = True
                 self.event_queue.put((EventType.REDRAW, ))
+
+                now = datetime.now()
 
                 if message_data[0] == MessageType.VOICE:
                     voice_data = message_data[1]
@@ -531,30 +549,30 @@ class VoiceCoder:
 
                     if self.log_voice:
                         try:
-                            logdir = join_path(APP_DATA_DIR, 'voicelog')
-                            now = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-                            mp3_filename = join_path(logdir, now + '.mp3')
+                            now_str = now.strftime('%Y-%m-%d_%H-%M-%S')
+                            mp3_filename = join_path(self.voicelog_dir, now_str + '.mp3')
 
                             try:
                                 with open(mp3_filename, "wb") as fp:
                                     fp.write(mp3_data)
                             except FileNotFoundError:
-                                os.makedirs(logdir, exist_ok=True)
+                                os.makedirs(self.voicelog_dir, exist_ok=True)
 
                                 with open(mp3_filename, "wb") as fp:
                                     fp.write(mp3_data)
                         except Exception as exc:
-                            logging.error('saving voice log error:', exc_info=exc)
-
-                    #with open(f"/tmp/recording_{recording_no:04d}.mp3", "wb") as fp:
-                    #    fp.write(mp3_data)
-                    #recording_no += 1
+                            logger.error('saving voice log error:', exc_info=exc)
 
                     self.event_queue.put((EventType.SET_MESSAGE, 'Processing voice message...', LEVEL_INFO))
                     whisper_response = self.openai.audio.transcriptions.create(
                         model="whisper-1",
                         file=("recording.mp3", io.BytesIO(mp3_data), 'audio/mpeg'),
+                        language=self.voice_lang or NOT_GIVEN,
                     )
+
+                    if not self.running:
+                        self.event_queue.put((EventType.CLEAR_MESSAGE, ))
+                        break
 
                     user_message = whisper_response.text
                     if user_message:
@@ -564,6 +582,12 @@ class VoiceCoder:
 
                 if not user_message:
                     continue
+
+                if self.message_log:
+                    now_str = now.strftime('%Y-%m-%d %H-%M-%S')
+                    self.message_log.write(f'# {now_str}\n')
+                    self.message_log.write(''.join(f'> {line}\n' for line in user_message.split('\n')))
+                    self.message_log.write('\n')
 
                 if self.lexer:
                     lang = self.lexer.name
@@ -576,7 +600,7 @@ class VoiceCoder:
                 # TODO: put all context data in event, don't touch self here
                 start_lineno = self.scroll_yoffset + 1
                 end_lineno = max(start_lineno + self.term_size.lines + 1, 0)
-                logging.debug(f"sending message: {user_message!r}")
+                logger.info(f"sending message: {user_message!r}")
                 content = self.content
                 response = self.openai.chat.completions.create(
                     model="gpt-4-1106-preview",
@@ -594,7 +618,7 @@ class VoiceCoder:
                         },
                         {
                             "role": "user",
-                            "content": user_message
+                            "content": user_message,
                         }
                     ],
                     max_tokens=MAX_TOKENS,
@@ -615,16 +639,22 @@ class VoiceCoder:
 
                 choice = response.choices[0]
                 bot_message = choice.message.content or ''
+
+                if self.message_log:
+                    self.message_log.write(''.join(f'< {line}\n' for line in bot_message.split('\n')))
+                    self.message_log.write('\n')
+
                 update_data = parse_content_update(bot_message, content, lang)
 
-                logging.debug(f"message thread: parsed response:\n {update_data}")
+                logger.info(f"message thread: parsed response:\n {update_data}")
 
                 self.event_queue.put((EventType.CONTENT_UPDATE, update_data))
             except Exception as exc:
-                logging.error('message thread error:', exc_info=exc)
+                logger.error('message thread error:', exc_info=exc)
                 self.event_queue.put((EventType.SET_MESSAGE, f'OpenAI error: {exc}', LEVEL_ERROR))
             finally:
                 self.waiting_for_openai = False
+                self.event_queue.put((EventType.REDRAW, ))
 
     def _recorder_thread_func(self) -> None:
         samplerate = 44100
@@ -694,7 +724,7 @@ class VoiceCoder:
                     stream.close()
 
             except Exception as exc:
-                logging.error('recorder thread error:', exc_info=exc)
+                logger.error('recorder thread error:', exc_info=exc)
                 self.event_queue.put((EventType.SET_MESSAGE, f'recording error: {exc}', LEVEL_ERROR))
 
     @property
@@ -762,7 +792,7 @@ class VoiceCoder:
         if self.undo_history:
             item = self.undo_history.pop()
             undo, _redo = item
-            content = self.content.encode()
+            #content = self.content.encode()
             new_content = undo
             #if isinstance(undo, str):
             #    new_content = undo
@@ -770,6 +800,7 @@ class VoiceCoder:
             #    new_content = xdelta3.decode(content, undo).decode()
             self.set_content(new_content)
             self.redo_history.append(item)
+            self.saved = False
         else:
             self.set_message('Already at oldest change', LEVEL_WARNING)
 
@@ -777,7 +808,7 @@ class VoiceCoder:
         if self.redo_history:
             item = self.redo_history.pop()
             _undo, redo = item
-            content = self.content.encode()
+            #content = self.content.encode()
             new_content = redo
             #if isinstance(redo, str):
             #    new_content = redo
@@ -785,6 +816,7 @@ class VoiceCoder:
             #    new_content = xdelta3.decode(content, redo).decode()
             self.set_content(new_content)
             self.undo_history.append(item)
+            self.saved = False
         else:
             self.set_message('Already at newest change', LEVEL_WARNING)
 
@@ -800,7 +832,7 @@ class VoiceCoder:
             with open(self.filename, 'w') as fp:
                 fp.write(self.content)
         except Exception as exc:
-            logging.error('Error saving file:', exc_info=exc)
+            logger.error('Error saving file:', exc_info=exc)
             self.set_message(f'Error saving file: {exc}', LEVEL_ERROR)
         else:
             self.saved = True
@@ -809,6 +841,14 @@ class VoiceCoder:
     def save_as(self) -> None:
         try:
             self.filename = self.prompt('Filename: ')
+        except KeyboardInterrupt:
+            self.set_message('Cancelled')
+        else:
+            self.save()
+
+    def open(self) -> None:
+        try:
+            self.open_file(self.prompt('Filename: '))
         except KeyboardInterrupt:
             self.set_message('Cancelled')
         else:
@@ -841,6 +881,8 @@ class VoiceCoder:
                 self.save()
             elif raw == b'W':
                 self.save_as()
+            elif raw == b'e':
+                self.open()
             elif raw == b' ':
                 if self.recording:
                     self.recording = False
@@ -848,7 +890,7 @@ class VoiceCoder:
                     self.recorder_semaphore.release()
             elif raw == b'\n':
                 self.clear_message()
-            elif raw == b'z':
+            elif raw == b'u':
                 self.undo()
             elif raw == b'r':
                 self.redo()
@@ -870,7 +912,7 @@ class VoiceCoder:
                             self.message_queue.put((MessageType.TEXT, message))
 
                 except Exception as exc:
-                    logging.error('Error processing message:', exc_info=exc)
+                    logger.error('Error processing message:', exc_info=exc)
                     self.set_message(f'Error processing message: {exc}', LEVEL_ERROR)
             elif decoded:
                 prefix, suffix, args = decoded
@@ -914,6 +956,16 @@ class VoiceCoder:
     def start(self) -> None:
         signal(SIGWINCH, self._handle_sigwinch)
 
+        if self.log_messages:
+            msg_log_file = join_path(APP_DATA_DIR, 'messages.log')
+            try:
+                self.message_log = open(msg_log_file, 'at')
+            except FileNotFoundError:
+                os.makedirs(APP_DATA_DIR, exist_ok=True)
+                self.message_log = open(msg_log_file, 'at')
+        else:
+            self.message_log = None
+
         self.running = True
         self.input_thread.start()
         self.message_thread.start()
@@ -952,16 +1004,19 @@ class VoiceCoder:
                         elif event[0] == EventType.FUNC_CALL:
                             pass # TODO
 
-                        elif event[0] == EventType.VOICE_COMMAND:
-                            pass # TODO
-
                         elif event[0] == EventType.SET_MESSAGE:
                             self.set_message(event[1], event[2])
+
+                        elif event[0] == EventType.CLEAR_MESSAGE:
+                            self.clear_message()
+
+                        else:
+                            logger.error(f'unhandled event: {event}')
 
                     except KeyboardInterrupt:
                         self.set_message("Keyboard Interrrupt, use q for quit", LEVEL_WARNING)
                     except Exception as exc:
-                        logging.error("error in event loop:", exc_info=exc)
+                        logger.error("error in event loop:", exc_info=exc)
                         self.set_message(str(exc), LEVEL_ERROR)
 
                 self.set_message("Exiting...")
@@ -978,8 +1033,12 @@ class VoiceCoder:
                     self.message_thread.join()
                     self.recorder_thread.join()
 
+                    if self.message_log is not None:
+                        self.message_log.close()
+                        self.message_log = None
+
                 except Exception as exc:
-                    logging.error("error while exiting:", exc_info=exc)
+                    logger.error("error while exiting:", exc_info=exc)
                 finally:
                     # show cursor
                     sys.stdout.write('\x1b[?25h')
@@ -988,8 +1047,8 @@ class VoiceCoder:
 
                     signal(SIGWINCH, SIG_DFL)
 
-    def __enter__(self) -> None:
-        pass
+    def __enter__(self) -> 'VoiceCoder':
+        return self
 
     def __exit__(self, *args) -> None:
         self.stdin.close()
@@ -1124,6 +1183,8 @@ def main() -> None:
     optparser.add_option('--log-file', default=DEFAULT_LOGFILE, metavar='PATH', help=f"default: {DEFAULT_LOGFILE}")
     optparser.add_option('--log-level', choices=log_levels, default=DEFAULT_LEVEL, metavar='LEVEL', help=f"One of: {', '.join(log_levels)}. default: {DEFAULT_LEVEL}")
     optparser.add_option('--log-voice', action='store_true', default=False)
+    optparser.add_option('--log-messages', action='store_true', default=False)
+    optparser.add_option('--voice-lang', metavar='LANG', default=None, help='ISO-639-1 two-letter language code for voice input')
     opts, args = optparser.parse_args()
 
     if len(args) != 1:
@@ -1139,7 +1200,12 @@ def main() -> None:
     )
 
     filename = args[0]
-    coder = VoiceCoder(filename, log_voice=opts.log_voice)
+    coder = VoiceCoder(
+        filename=filename,
+        log_voice=opts.log_voice,
+        log_messages=opts.log_messages,
+        voice_lang=opts.voice_lang,
+    )
     coder.start()
 
 if __name__ == '__main__':
