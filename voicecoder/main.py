@@ -277,6 +277,68 @@ HELP = """\
     Use Ctrl+HOME/Ctrl+END to jump to the start/end of the file.
 """
 
+WORD_BORDER = re.compile(r'\b')
+
+def wrap_words(lines: list[str], columns: int) -> list[str]:
+    wrapped_lines: list[str] = []
+    if columns <= 0:
+        return wrapped_lines
+
+    new_line: list[str] = []
+    for line in lines:
+        if not line:
+            wrapped_lines.append(line)
+        else:
+            acc_w = 0
+            for word in WORD_BORDER.split(line):
+                if not word:
+                    continue
+                w = wcswidth(word)
+                new_acc_w = acc_w + w
+                if new_acc_w > columns:
+                    stripped_word = word.rstrip()
+                    if new_line:
+                        wrapped_lines.append(''.join(new_line))
+                        new_line.clear()
+                    acc_w = 0
+                    if stripped_word:
+                        word = stripped_word
+                        w = wcswidth(word)
+                        if w <= columns:
+                            new_line.append(word)
+                            acc_w = w
+                        else:
+                            while word:
+                                for index in range(1, len(word)):
+                                    slice = word[:index]
+                                    w = wcswidth(slice)
+                                    if w > columns:
+                                        index -= 1
+                                        slice = word[:index]
+                                        word  = word[index:]
+                                        wrapped_lines.append(slice)
+                                        break
+                                    elif w == columns:
+                                        slice = word[:index]
+                                        word  = word[index:]
+                                        wrapped_lines.append(slice)
+                                        break
+                                else:
+                                    w = wcswidth(word)
+                                    if w <= columns:
+                                        wrapped_lines.append(word)
+                                    else:
+                                        # no fitting slice found!
+                                        wrapped_lines.append('…')
+                                    break
+                else:
+                    new_line.append(word)
+                    acc_w = new_acc_w
+            if new_line:
+                wrapped_lines.append(''.join(new_line))
+                new_line.clear()
+    return wrapped_lines
+
 InputData = tuple[Union[bytes, bytearray], Optional[tuple[int, int, list[int]]]]
 
 class ContentUpdate(NamedTuple):
@@ -1375,42 +1437,16 @@ class VoiceCoder:
                     message = ['Please speak now... (silence)']
                 else:
                     message = ['Please speak now...']
-        message_lines: list[str] = []
+        message_lines: list[str]
         if message and columns > 0:
-            # wrapping message lines
-            for line in message:
-                w = wcswidth(line)
-                if w > columns:
-                    prev = 0
-                    line_len = len(line)
-                    while prev < line_len:
-                        next_prev = line_len
-                        start_index = prev
-                        end_index = prev
-                        for index in range(min(max(next_prev, prev + columns - 1), line_len), line_len + 1):
-                            chunk = line[start_index:index]
-                            w = wcswidth(chunk)
-                            if w > columns:
-                                end_index = index - 1
-                                if end_index <= prev:
-                                    next_prev = prev + 1
-                                else:
-                                    next_prev = end_index
-                                break
-                            elif w == columns:
-                                next_prev = index
-                                end_index = index
-                                break
-
-                        message_lines.append(line[start_index:end_index])
-                        prev = next_prev
-                else:
-                    message_lines.append(line)
+            message_lines = wrap_words(message, columns)
 
             max_yoffset -= len(message_lines)
 
             if max_yoffset < scroll_yoffset:
                 max_yoffset = scroll_yoffset
+        else:
+            message_lines = []
 
         max_lineno_len = len(str(len(self.lines) + 1))
         avail_columns = max(columns - max_lineno_len - 1, 0)
