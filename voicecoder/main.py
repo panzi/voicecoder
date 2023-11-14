@@ -4,11 +4,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from typing import Optional, BinaryIO, TextIO, Union, NamedTuple, Literal
+from typing import Optional, BinaryIO, TextIO, Union, NamedTuple, Literal, List
 
 import os
 import io
 import sys
+import json
 import optparse
 import termios
 import platform
@@ -27,6 +28,7 @@ from threading import Thread, Semaphore
 from enum import Enum
 from datetime import datetime
 from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
 from openai._types import NOT_GIVEN
 from pygments import format as colorize
 from pygments.lexer import Lexer
@@ -62,9 +64,16 @@ DEFAULT_LEVEL = 'INFO'
 APP_DATA_DIR = get_app_data_dir()
 DEFAULT_LOGFILE = join_path(APP_DATA_DIR, 'session.log')
 
-CTRL = [1, 5]
-PAGE_UP = (-1, 126, [5])
-PAGE_DOWN = (-1, 126, [6])
+ARGS_CTRL = [1, 5]
+DECODED_PAGE_UP   = (-1, 126, [5])
+DECODED_PAGE_DOWN = (-1, 126, [6])
+
+INPUT_PAGE_UP   = (b'\x1b[5~', DECODED_PAGE_UP)
+INPUT_PAGE_DOWN = (b'\x1b[6~', DECODED_PAGE_DOWN)
+INPUT_CURSOR_UP    = (b'\x1b[A', (-1, 65, []))
+INPUT_CURSOR_DOWN  = (b'\x1b[B', (-1, 66, []))
+INPUT_CURSOR_LEFT  = (b'\x1b[D', (-1, 68, []))
+INPUT_CURSOR_RIGHT = (b'\x1b[C', (-1, 67, []))
 
 LEVEL_INFO    = 0
 LEVEL_WARNING = 1
@@ -106,16 +115,145 @@ GPT_MODELS = [
 DEFAULT_GPT_MODEL = 'gpt-4-1106-preview'
 
 MAX_TOKENS = 4096
-SYSTEM_MESSAGE_CONTENT = """\
-You're a programming accessibility tool. You will get natural language describing code and answer with valid {lang}. The natural language input comes from voice recognition and thus will omit a lot of special characters which you will have to fill in. Be sure to always echo back the whole edited file. Keep any messages about what you where doing very short.
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "page_down",
+            "description": "Scroll the view down by one page.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "page_up",
+            "description": "Scroll the view up by one page.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cursor_down",
+            "description": "Scroll the view down by one line.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cursor_up",
+            "description": "Scroll the view up by one line.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cursor_left",
+            "description": "Scroll the view left by one column.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cursor_right",
+            "description": "Scroll the view right by one column.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "undo",
+            "description": "Undo last change.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "redo",
+            "description": "Redo previously reverted change.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save",
+            "description": "Save changes of current file.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "quit",
+            "description": "Quit the code editor.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+        }
+    },
+]
+
+REST_UNCHANGED_MARK = '[The rest of the file remains unchanged]'
+
+SYSTEM_MESSAGE_CONTENT = f"""\
+You're a programming accessibility tool. You will get natural language describing code and answer with valid {{lang}}. The natural language input comes from voice recognition and thus will omit a lot of special characters which you will have to fill in. Be sure to always echo back the whole edited file. Keep any messages about what you where doing very short.
+
+If you reply with only the head of the file leaving the rest unchange please keep some unchanged context lines, don't add an ellipsis, but insert this line as a comment at the end:
+{REST_UNCHANGED_MARK}
 
 The name of the current file is:
-{filename}
+{{filename}}
 
-The user is currently viewing line {start_lineno} to {end_lineno} of this file.
+The user is currently viewing line {{start_lineno}} to {{end_lineno}} of this file.
 
 This is the content of the file:
-{code}"""
+{{code}}"""
 
 HELP = """\
     Hotkeys
@@ -213,8 +351,6 @@ class EchoedInput:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_attrs)
         # hide cursor
         sys.stdout.write('\x1b[?25l')
-
-REST_UNCHANGED_MARK = '... [The rest of the file remains unchanged] ...'
 
 DASHDASH_COMMENT_REST_UNCHANGED_MARK = f'-- {REST_UNCHANGED_MARK}'
 HASH_COMMENT_REST_UNCHANGED_MARK = f'# {REST_UNCHANGED_MARK}'
@@ -457,7 +593,7 @@ class VoiceCoder:
         'message_queue', 'input_semaphore', 'waiting_for_openai', 'running',
         'recorder_semaphore', 'recording', 'silence', 'log_voice',
         'voicelog_dir', 'message_log', 'log_messages', 'voice_lang',
-        'sound_device', 'samplerate', 'gpt_model',
+        'sound_device', 'samplerate', 'gpt_model', 'enable_tools',
     )
 
     scroll_xoffset: int
@@ -498,6 +634,7 @@ class VoiceCoder:
     sound_device: Optional[str]
     samplerate: int
     gpt_model: GptModelType
+    enable_tools: bool
 
     def __init__(self,
                  filename: str,
@@ -507,6 +644,7 @@ class VoiceCoder:
                  sound_device: Optional[str] = None,
                  samplerate: int = DEFAULT_SAMPLERATE,
                  gpt_model: GptModelType = DEFAULT_GPT_MODEL,
+                 enable_tools: bool = False,
     ) -> None:
         self.scroll_xoffset = 0
         self.scroll_yoffset = 0
@@ -536,6 +674,7 @@ class VoiceCoder:
         self.sound_device = sound_device
         self.samplerate = samplerate
         self.gpt_model = gpt_model
+        self.enable_tools = enable_tools
 
         self.open_file(self.filename)
 
@@ -652,49 +791,118 @@ class VoiceCoder:
                     lang = None
                     lang_name = 'code'
 
-                # TODO: functions for saving, loading, scrolling etc.
                 # TODO: put all context data in event, don't touch self here
                 start_lineno = self.scroll_yoffset + 1
                 end_lineno = max(start_lineno + self.term_size.lines + 1, 0)
                 logger.info(f"sending message: {user_message!r}")
                 content = self.content
+                messages: List[ChatCompletionMessageParam] = []
+                messages.append({
+                    "role": "system",
+                    "content": SYSTEM_MESSAGE_CONTENT.format(
+                        lang=lang_name,
+                        code=content,
+                        start_lineno=start_lineno,
+                        end_lineno=end_lineno,
+                        filename=self.filename,
+                    )
+                })
+                messages.append({
+                    "role": "user",
+                    "content": user_message,
+                })
+
+                # model="gpt-4-1106-preview"
+                # model="gpt-3.5-turbo-16k"
+
                 response = self.openai.chat.completions.create(
                     model=self.gpt_model,
-                    #model="gpt-4-1106-preview",
-                    #model="gpt-3.5-turbo-16k",
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": SYSTEM_MESSAGE_CONTENT.format(
-                                lang=lang_name,
-                                code=content,
-                                start_lineno=start_lineno,
-                                end_lineno=end_lineno,
-                                filename=self.filename,
-                            )
-                        },
-                        {
-                            "role": "user",
-                            "content": user_message,
-                        }
-                    ],
+                    messages=messages,
                     max_tokens=MAX_TOKENS,
-                    #functions=[
-                    #    {
-                    #        "name": "save",
-                    #        "description": "Save changes of current file",
-                    #        "parameters": {
-                    #            "type": "object",
-                    #            "properties": {},
-                    #            "required": [],
-                    #        }
-                    #    }
-                    #],
-                    #function_call='auto',
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "page_down",
+                                "description": "Scroll the view down by one page.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {},
+                                    "required": [],
+                                }
+                            }
+                        }
+                    ] if self.enable_tools else NOT_GIVEN,
+                    tool_choice='auto' if self.enable_tools else NOT_GIVEN,
                 )
-                #print("message thread: response:\n", response, file=sys.stderr)
+                logger.info(f"response message: {response}")
 
                 choice = response.choices[0]
+                tool_calls = choice.message.tool_calls
+
+                if tool_calls and self.enable_tools:
+                    # TODO: more functions?
+                    if choice.message.content is None:
+                        choice.message.content = ''
+                    messages.append(choice.message) # type: ignore
+
+                    illegal_tool = False
+                    for tool_call in tool_calls:
+                        func = tool_call.function
+                        func_name = func.name
+                        logger.info(f'called tool {func_name} {func.arguments}')
+                        args = json.loads(func.arguments)
+                        if func_name == 'page_up':
+                            self.event_queue.put((EventType.INPUT, INPUT_PAGE_UP))
+                            retval = '{"status":"done"}'
+                        elif func_name == 'page_down':
+                            self.event_queue.put((EventType.INPUT, INPUT_PAGE_DOWN))
+                            retval = '{"status":"done"}'
+                        elif func_name == 'cursor_down':
+                            self.event_queue.put((EventType.INPUT, INPUT_CURSOR_DOWN))
+                            retval = '{"status":"done"}'
+                        elif func_name == 'cursor_up':
+                            self.event_queue.put((EventType.INPUT, INPUT_CURSOR_UP))
+                            retval = '{"status":"done"}'
+                        elif func_name == 'cursor_left':
+                            self.event_queue.put((EventType.INPUT, INPUT_CURSOR_LEFT))
+                            retval = '{"status":"done"}'
+                        elif func_name == 'cursor_right':
+                            self.event_queue.put((EventType.INPUT, INPUT_CURSOR_RIGHT))
+                            retval = '{"status":"done"}'
+                        elif func_name == 'undo':
+                            self.event_queue.put((EventType.INPUT, (b'u', None)))
+                            retval = '{"status":"done"}'
+                        elif func_name == 'redo':
+                            self.event_queue.put((EventType.INPUT, (b'r', None)))
+                            retval = '{"status":"done"}'
+                        elif func_name == 'save':
+                            self.event_queue.put((EventType.INPUT, (b'w', None)))
+                            retval = '{"status":"done"}'
+                        elif func_name == 'quit':
+                            self.event_queue.put((EventType.INPUT, (b'q', None)))
+                            retval = '{"status":"done"}'
+                        else:
+                            logger.error(f'message thread: illegal tool call: {func_name} {func.arguments}')
+                            illegal_tool = True
+                            continue
+
+                        messages.append({ # type: ignore
+                            "tool_call_id": tool_call.id,
+                            "role": "tool",
+                            "name": func_name,
+                            "content": retval,
+                        })
+
+                    if illegal_tool:
+                        continue
+
+                    response = self.openai.chat.completions.create(
+                        model=self.gpt_model,
+                        messages=messages,
+                        max_tokens=MAX_TOKENS,
+                    )
+
                 bot_message = choice.message.content or ''
 
                 if self.message_log:
@@ -703,7 +911,7 @@ class VoiceCoder:
 
                 update_data = parse_content_update(bot_message, content, lang)
 
-                logger.info(f"message thread: parsed response:\n {update_data}")
+                logger.info(f"message thread: parsed response:\n{update_data}")
 
                 self.event_queue.put((EventType.CONTENT_UPDATE, update_data))
             except Exception as exc:
@@ -986,18 +1194,18 @@ class VoiceCoder:
                         if self.scroll_xoffset > 0:
                             self.scroll_xoffset -= 1
                     elif suffix == 70: # END
-                        if args == CTRL: # CTRL+END
+                        if args == ARGS_CTRL: # CTRL+END
                             self.scroll_yoffset = self.max_yoffset
                         else:
                             self.scroll_xoffset = self.max_xoffset
                     elif suffix == 72: # HOME
-                        if args == CTRL: # CTRL+HOME
+                        if args == ARGS_CTRL: # CTRL+HOME
                             self.scroll_yoffset = 0
                         else:
                             self.scroll_xoffset = 0
-                    elif decoded == PAGE_UP:
+                    elif decoded == DECODED_PAGE_UP:
                         self.scroll_yoffset = max(self.scroll_yoffset - self.term_size.lines, 0)
-                    elif decoded == PAGE_DOWN:
+                    elif decoded == DECODED_PAGE_DOWN:
                         self.scroll_yoffset = min(self.scroll_yoffset + self.term_size.lines, self.max_yoffset)
                     else:
                         self.show_unknown_shortcut()
@@ -1245,6 +1453,7 @@ def main() -> None:
     optparser.add_option('--sound-device', metavar='DEVICE_ID', default=None)
     optparser.add_option('--samplerate', type=int, default=DEFAULT_SAMPLERATE, help=f'default: {DEFAULT_SAMPLERATE}')
     optparser.add_option('--gpt-model', metavar='MODEL', choices=GPT_MODELS, default=DEFAULT_GPT_MODEL, help=f"One of: {', '.join(GPT_MODELS)}. default: {DEFAULT_GPT_MODEL}")
+    optparser.add_option('--enable-tools', action='store_true', default=False, help=f'Experiments for controlling other editor features via tools.')
     opts, args = optparser.parse_args()
 
     if len(args) != 1:
@@ -1265,13 +1474,14 @@ def main() -> None:
 
     filename = args[0]
     coder = VoiceCoder(
-        filename=filename,
-        log_voice=opts.log_voice,
-        log_messages=opts.log_messages,
-        voice_lang=opts.voice_lang,
-        sound_device=opts.sound_device,
-        samplerate=opts.samplerate,
-        gpt_model=opts.gpt_model,
+        filename     = filename,
+        log_voice    = opts.log_voice,
+        log_messages = opts.log_messages,
+        voice_lang   = opts.voice_lang,
+        sound_device = opts.sound_device,
+        samplerate   = opts.samplerate,
+        gpt_model    = opts.gpt_model,
+        enable_tools = opts.enable_tools,
     )
     coder.start()
 
