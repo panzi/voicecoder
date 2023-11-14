@@ -583,15 +583,16 @@ def slice_token_line(tokens: list[tuple[_TokenType, str]], offset: int, length: 
                     tok_data_prefix = tok_data[:index]
                     w = wcswidth(tok_data_prefix)
                     if current_offset + w >= offset:
+                        current_offset += w
                         tok_data = tok_data[index:]
                         break
-            if next_offset >= max_offset:
+            if next_offset > max_offset:
                 # TODO: don't cut in the middle of graphemes
                 for index in range(len(tok_data), -1, -1):
                     new_tok_data = tok_data[:index]
                     w = wcswidth(new_tok_data)
                     next_offset = current_offset + w
-                    if next_offset < max_offset:
+                    if next_offset <= max_offset:
                         line.append((tok_type, new_tok_data))
                         return line
                 return line
