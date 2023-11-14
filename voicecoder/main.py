@@ -872,34 +872,34 @@ class VoiceCoder:
                         args = json.loads(func.arguments)
                         if func_name == 'page_up':
                             self.event_queue.put((EventType.INPUT, INPUT_PAGE_UP))
-                            retval = '{"status":"done"}'
+                            retval = '{"success":true}'
                         elif func_name == 'page_down':
                             self.event_queue.put((EventType.INPUT, INPUT_PAGE_DOWN))
-                            retval = '{"status":"done"}'
+                            retval = '{"success":true}'
                         elif func_name == 'cursor_down':
                             self.event_queue.put((EventType.INPUT, INPUT_CURSOR_DOWN))
-                            retval = '{"status":"done"}'
+                            retval = '{"success":true}'
                         elif func_name == 'cursor_up':
                             self.event_queue.put((EventType.INPUT, INPUT_CURSOR_UP))
-                            retval = '{"status":"done"}'
+                            retval = '{"success":true}'
                         elif func_name == 'cursor_left':
                             self.event_queue.put((EventType.INPUT, INPUT_CURSOR_LEFT))
-                            retval = '{"status":"done"}'
+                            retval = '{"success":true}'
                         elif func_name == 'cursor_right':
                             self.event_queue.put((EventType.INPUT, INPUT_CURSOR_RIGHT))
-                            retval = '{"status":"done"}'
+                            retval = '{"success":true}'
                         elif func_name == 'undo':
                             self.event_queue.put((EventType.INPUT, (b'u', None)))
-                            retval = '{"status":"done"}'
+                            retval = '{"success":true}'
                         elif func_name == 'redo':
                             self.event_queue.put((EventType.INPUT, (b'r', None)))
-                            retval = '{"status":"done"}'
+                            retval = '{"success":true}'
                         elif func_name == 'save':
                             self.event_queue.put((EventType.INPUT, (b'w', None)))
-                            retval = '{"status":"done"}'
+                            retval = '{"success":true}'
                         elif func_name == 'quit':
                             self.event_queue.put((EventType.INPUT, (b'q', None)))
-                            retval = '{"status":"done"}'
+                            retval = '{"success":true}'
                         else:
                             logger.error(f'message thread: illegal tool call: {func_name} {func.arguments}')
                             illegal_tool = True
