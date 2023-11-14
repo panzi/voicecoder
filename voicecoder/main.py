@@ -447,13 +447,13 @@ def parse_content_update(message: str, old_content: str, lang: Optional[str]) ->
             last_line_index += 1
         last_line = new_code[last_line_index:]
         last_line_pattern = rf'^{re.escape(last_line)}[ \t]*$'
-        logger.info(f'LAST LINE: {last_line!r} -> {last_line_pattern!r}')
+        logger.debug(f'reconstructing truncated file with last line: {last_line!r}')
         match = re.search(last_line_pattern, old_content, re.M)
         if match:
-            logger.info("MATCHED CONTEXT LINE")
+            logger.debug("MATCHED CONTEXT LINE")
             code = f'{new_code}\n{old_content[match.end():]}'
         else:
-            logger.info("CONTEXT LINE NOT FOUND!!")
+            logger.debug("CONTEXT LINE NOT FOUND!")
             code = f'{new_code}\n{old_content}'
 
         #line_count = code.count('\n') + 1
@@ -853,7 +853,7 @@ class VoiceCoder:
                     ] if self.enable_tools else NOT_GIVEN,
                     tool_choice='auto' if self.enable_tools else NOT_GIVEN,
                 )
-                logger.info(f"response message: {response}")
+                logger.debug(f"response message: {response}")
 
                 choice = response.choices[0]
                 tool_calls = choice.message.tool_calls
@@ -868,7 +868,7 @@ class VoiceCoder:
                     for tool_call in tool_calls:
                         func = tool_call.function
                         func_name = func.name
-                        logger.info(f'called tool {func_name} {func.arguments}')
+                        logger.info(f'message thread: called tool: {func_name} {func.arguments}')
                         args = json.loads(func.arguments)
                         if func_name == 'page_up':
                             self.event_queue.put((EventType.INPUT, INPUT_PAGE_UP))
