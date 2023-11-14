@@ -4,8 +4,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from typing import Optional, BinaryIO, TextIO, Union, NamedTuple, Literal, List
+from typing import Optional, BinaryIO, TextIO, Union, NamedTuple, Literal, List, Pattern
 
+import re
 import os
 import io
 import sys
@@ -239,12 +240,13 @@ TOOLS = [
     },
 ]
 
-REST_UNCHANGED_MARK = '[The rest of the file remains unchanged]'
+REST_UNCHANGED_MARK = '[The rest of the file' + \
+                      ' remains unchanged]'
 
 SYSTEM_MESSAGE_CONTENT = f"""\
 You're a programming accessibility tool. You will get natural language describing code and answer with valid {{lang}}. The natural language input comes from voice recognition and thus will omit a lot of special characters which you will have to fill in. Be sure to always echo back the whole edited file. Keep any messages about what you where doing very short.
 
-If you reply with only the head of the file leaving the rest unchange please keep some unchanged context lines, don't add an ellipsis, but insert this line as a comment at the end:
+If you reply with only the head of the file leaving the rest unchange please keep some unchanged context lines if possible, don't add an ellipsis, but insert this line as a comment at the end:
 {REST_UNCHANGED_MARK}
 
 The name of the current file is:
@@ -352,15 +354,19 @@ class EchoedInput:
         # hide cursor
         sys.stdout.write('\x1b[?25l')
 
-DASHDASH_COMMENT_REST_UNCHANGED_MARK = f'-- {REST_UNCHANGED_MARK}'
-HASH_COMMENT_REST_UNCHANGED_MARK = f'# {REST_UNCHANGED_MARK}'
-INLINE_C_COMMENT_REST_UNCHANGED_MARK = f'// {REST_UNCHANGED_MARK}'
-MULTILINE_C_COMMENT_REST_UNCHANGED_MARK = f'/* {REST_UNCHANGED_MARK} */'
-OCAML_COMMENT_REST_UNCHANGED_MARK = f'(** {REST_UNCHANGED_MARK} *)'
-SEMICOLON_COMMENT_REST_UNCHANGED_MARK = f'; {REST_UNCHANGED_MARK}'
-SGML_REST_UNCHANGED_MARK = f'<!-- {REST_UNCHANGED_MARK} -->'
+ELLIPSIS = r'(?:\.\.\.)?'
+REST_UNCHANGED_MARK_PATTERN = rf'[ \t]*{ELLIPSIS}[ \t]*\[?(?:The )?(?:(?:rest of|remaining code in) the file|rest of the code) remains (?:unchanged|the same)\]?[ \t]*{ELLIPSIS}[ \t]*'
+FALLBACK_REST_UNCHANGED_MARK = re.compile(rf'^[ \t]*(?:[#;]|//|--|/\*|\(\*\*|<!--)?{REST_UNCHANGED_MARK_PATTERN}(?:\*/|\*\)|-->)?[ \t]*$', re.M | re.I)
 
-REST_UNCHANGED_MARKS: dict[Optional[str], str] = {
+DASHDASH_COMMENT_REST_UNCHANGED_MARK    = re.compile(rf'^[ \t]*--{   REST_UNCHANGED_MARK_PATTERN}[ \t]*$', re.M | re.I)
+HASH_COMMENT_REST_UNCHANGED_MARK        = re.compile(rf'^[ \t]*#{    REST_UNCHANGED_MARK_PATTERN}[ \t]*$', re.M | re.I)
+INLINE_C_COMMENT_REST_UNCHANGED_MARK    = re.compile(rf'^[ \t]*//{   REST_UNCHANGED_MARK_PATTERN}[ \t]*$', re.M | re.I)
+MULTILINE_C_COMMENT_REST_UNCHANGED_MARK = re.compile(rf'^[ \t]*/\*{  REST_UNCHANGED_MARK_PATTERN}\*/[ \t]*$', re.M | re.I)
+OCAML_COMMENT_REST_UNCHANGED_MARK       = re.compile(rf'^[ \t]*(\*\*{REST_UNCHANGED_MARK_PATTERN}\*)[ \t]*$', re.M | re.I)
+SEMICOLON_COMMENT_REST_UNCHANGED_MARK   = re.compile(rf'^[ \t]*;{    REST_UNCHANGED_MARK_PATTERN}[ \t]*$', re.M | re.I)
+SGML_REST_UNCHANGED_MARK                = re.compile(rf'^[ \t]*<!--{ REST_UNCHANGED_MARK_PATTERN}-->[ \t]*$', re.M | re.I)
+
+REST_UNCHANGED_MARKS: dict[Optional[str], Pattern] = {
     'Bash': HASH_COMMENT_REST_UNCHANGED_MARK,
     'C#': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
     'C': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
@@ -372,6 +378,7 @@ REST_UNCHANGED_MARKS: dict[Optional[str], str] = {
     'HTML': SGML_REST_UNCHANGED_MARK,
     'Java': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
     'JavaScript': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
+    'Kotlin': INLINE_C_COMMENT_REST_UNCHANGED_MARK,
     'Lua': DASHDASH_COMMENT_REST_UNCHANGED_MARK,
     'Nginx configuration file': HASH_COMMENT_REST_UNCHANGED_MARK,
     'Nimrod': HASH_COMMENT_REST_UNCHANGED_MARK,
@@ -428,23 +435,33 @@ def parse_content_update(message: str, old_content: str, lang: Optional[str]) ->
 
     # HACK: Try to handle when OpenAI is truncating the file marking with:
     #       # ... [The rest of the file remains unchanged] ...
-    mark = REST_UNCHANGED_MARKS.get(lang, REST_UNCHANGED_MARK)
-    index = code.find(mark)
+    mark = REST_UNCHANGED_MARKS.get(lang, FALLBACK_REST_UNCHANGED_MARK)
+    match = mark.search(code)
 
-    if index != -1 and not code[index:].strip():
-        new_code = code[:index].rstrip()
+    if match and not code[match.end():].strip():
+        new_code = code[:match.start()].rstrip()
         last_line_index = new_code.rfind('\n')
         if last_line_index == -1:
             last_line_index = 0
         else:
             last_line_index += 1
         last_line = new_code[last_line_index:]
-        line_count = code.count('\n') + 1
-        index = find_mark_line(last_line, old_content, line_count)
-        if index >= 0:
-            code = new_code + '\n' + old_content[index:]
+        last_line_pattern = rf'^{re.escape(last_line)}[ \t]*$'
+        logger.info(f'LAST LINE: {last_line!r} -> {last_line_pattern!r}')
+        match = re.search(last_line_pattern, old_content, re.M)
+        if match:
+            logger.info("MATCHED CONTEXT LINE")
+            code = f'{new_code}\n{old_content[match.end():]}'
+        else:
+            logger.info("CONTEXT LINE NOT FOUND!!")
+            code = f'{new_code}\n{old_content}'
 
-            logger.info('reconstructing truncated code')
+        #line_count = code.count('\n') + 1
+        #index = find_mark_line(last_line, old_content, line_count)
+        #if index >= 0:
+        #    code = new_code + '\n' + old_content[index:]
+        #
+        #    logger.info('reconstructing truncated code')
 
     return ContentUpdate(code=code, message=new_message or None)
 
@@ -783,6 +800,7 @@ class VoiceCoder:
                     self.message_log.write(f'# {now_str}\n')
                     self.message_log.write(''.join(f'> {line}\n' for line in user_message.split('\n')))
                     self.message_log.write('\n')
+                    self.message_log.flush()
 
                 if self.lexer:
                     lang = self.lexer.name
@@ -908,6 +926,7 @@ class VoiceCoder:
                 if self.message_log:
                     self.message_log.write(''.join(f'< {line}\n' for line in bot_message.split('\n')))
                     self.message_log.write('\n')
+                    self.message_log.flush()
 
                 update_data = parse_content_update(bot_message, content, lang)
 
