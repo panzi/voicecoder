@@ -72,6 +72,39 @@ LEVEL_ERROR   = 2
 
 MAX_UNDO_STEPS = 1024
 
+GptModelType = Literal[
+    "gpt-4-1106-preview",
+    "gpt-4-vision-preview",
+    "gpt-4",
+    "gpt-4-0314",
+    "gpt-4-0613",
+    "gpt-4-32k",
+    "gpt-4-32k-0314",
+    "gpt-4-32k-0613",
+    "gpt-3.5-turbo",
+    "gpt-3.5-turbo-16k",
+    "gpt-3.5-turbo-0301",
+    "gpt-3.5-turbo-0613",
+    "gpt-3.5-turbo-16k-0613",
+]
+
+GPT_MODELS = [
+    "gpt-4-1106-preview",
+    "gpt-4",
+    "gpt-4-0314",
+    "gpt-4-0613",
+    "gpt-4-32k",
+    "gpt-4-32k-0314",
+    "gpt-4-32k-0613",
+    "gpt-3.5-turbo",
+    "gpt-3.5-turbo-16k",
+    "gpt-3.5-turbo-0301",
+    "gpt-3.5-turbo-0613",
+    "gpt-3.5-turbo-16k-0613",
+]
+
+DEFAULT_GPT_MODEL = 'gpt-4-1106-preview'
+
 MAX_TOKENS = 4096
 SYSTEM_MESSAGE_CONTENT = """\
 You're a programming accessibility tool. You will get natural language describing code and answer with valid {lang}. The natural language input comes from voice recognition and thus will omit a lot of special characters which you will have to fill in. Be sure to always echo back the whole edited file. Keep any messages about what you where doing very short.
@@ -424,7 +457,7 @@ class VoiceCoder:
         'message_queue', 'input_semaphore', 'waiting_for_openai', 'running',
         'recorder_semaphore', 'recording', 'silence', 'log_voice',
         'voicelog_dir', 'message_log', 'log_messages', 'voice_lang',
-        'sound_device', 'samplerate',
+        'sound_device', 'samplerate', 'gpt_model',
     )
 
     scroll_xoffset: int
@@ -464,8 +497,17 @@ class VoiceCoder:
     voice_lang: Optional[str]
     sound_device: Optional[str]
     samplerate: int
+    gpt_model: GptModelType
 
-    def __init__(self, filename: str, log_voice: bool = False, log_messages: bool = False, voice_lang: Optional[str] = None, sound_device: Optional[str] = None, samplerate: int = DEFAULT_SAMPLERATE) -> None:
+    def __init__(self,
+                 filename: str,
+                 log_voice: bool = False,
+                 log_messages: bool = False,
+                 voice_lang: Optional[str] = None,
+                 sound_device: Optional[str] = None,
+                 samplerate: int = DEFAULT_SAMPLERATE,
+                 gpt_model: GptModelType = DEFAULT_GPT_MODEL,
+    ) -> None:
         self.scroll_xoffset = 0
         self.scroll_yoffset = 0
         self.filename = filename
@@ -493,6 +535,7 @@ class VoiceCoder:
         self.voice_lang = voice_lang
         self.sound_device = sound_device
         self.samplerate = samplerate
+        self.gpt_model = gpt_model
 
         self.open_file(self.filename)
 
@@ -616,7 +659,8 @@ class VoiceCoder:
                 logger.info(f"sending message: {user_message!r}")
                 content = self.content
                 response = self.openai.chat.completions.create(
-                    model="gpt-4-1106-preview",
+                    model=self.gpt_model,
+                    #model="gpt-4-1106-preview",
                     #model="gpt-3.5-turbo-16k",
                     messages=[
                         {
@@ -1200,6 +1244,7 @@ def main() -> None:
     optparser.add_option('--voice-lang', metavar='LANG', default=None, help='ISO-639-1 two-letter language code for voice input')
     optparser.add_option('--sound-device', metavar='DEVICE_ID', default=None)
     optparser.add_option('--samplerate', type=int, default=DEFAULT_SAMPLERATE, help=f'default: {DEFAULT_SAMPLERATE}')
+    optparser.add_option('--gpt-model', metavar='MODEL', choices=GPT_MODELS, default=DEFAULT_GPT_MODEL, help=f"One of: {', '.join(GPT_MODELS)}. default: {DEFAULT_GPT_MODEL}")
     opts, args = optparser.parse_args()
 
     if len(args) != 1:
@@ -1226,6 +1271,7 @@ def main() -> None:
         voice_lang=opts.voice_lang,
         sound_device=opts.sound_device,
         samplerate=opts.samplerate,
+        gpt_model=opts.gpt_model,
     )
     coder.start()
 
