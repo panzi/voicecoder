@@ -17,6 +17,8 @@ return the changed part, but not in a way that can be automatically applied.
 You need to set the environment variable `OPENAI_API_KEY` to a valid value.
 It can be provided via a `.env` file in the current directory.
 
+[Demo Video](https://www.youtube.com/watch?v=xj5YZlEFLpE)
+
 ```plain
 Hotkeys
 -------
