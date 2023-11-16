@@ -218,7 +218,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "open",
-            "description": "Open another file.",
+            "description": "Open a file.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -943,6 +943,9 @@ class VoiceCoder:
                         func = tool_call.function
                         func_name = func.name
                         logger.info(f'message thread: called tool: {func_name} {func.arguments}')
+                        if self.message_log:
+                            self.message_log.write(f'# called tool: {func_name} {func.arguments}\n')
+                            self.message_log.flush()
                         args = json.loads(func.arguments)
                         if func_name == 'page_up':
                             self.event_queue.put((EventType.INPUT, INPUT_PAGE_UP))
@@ -988,6 +991,10 @@ class VoiceCoder:
                             "name": func_name,
                             "content": retval,
                         })
+
+                    if self.message_log:
+                        self.message_log.write('\n')
+                        self.message_log.flush()
 
                     if illegal_tool:
                         continue
