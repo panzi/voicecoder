@@ -217,6 +217,28 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "open",
+            "description": "Open another file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string"
+                    },
+                    "discard_changes": {
+                        "type": "boolean",
+                        "default": False,
+                    }
+                },
+                "required": [
+                    "filename"
+                ],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "save",
             "description": "Save changes of current file.",
             "parameters": {
@@ -353,6 +375,7 @@ class EventType(Enum):
     FUNC_CALL      = 3
     SET_MESSAGE    = 4
     CLEAR_MESSAGE  = 5
+    OPEN           = 6
 
 Event = Union[
     tuple[Literal[EventType.REDRAW]],
@@ -361,6 +384,7 @@ Event = Union[
     tuple[Literal[EventType.FUNC_CALL], str, list],
     tuple[Literal[EventType.SET_MESSAGE], str, int],
     tuple[Literal[EventType.CLEAR_MESSAGE]],
+    tuple[Literal[EventType.OPEN], str, bool],
 ]
 
 class MessageType(Enum):
@@ -900,20 +924,7 @@ class VoiceCoder:
                     model=self.gpt_model,
                     messages=messages,
                     max_tokens=MAX_TOKENS,
-                    tools=[
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "page_down",
-                                "description": "Scroll the view down by one page.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {},
-                                    "required": [],
-                                }
-                            }
-                        }
-                    ] if self.enable_tools else NOT_GIVEN,
+                    tools=TOOLS if self.enable_tools else NOT_GIVEN,
                     tool_choice='auto' if self.enable_tools else NOT_GIVEN,
                 )
                 logger.debug(f"response message: {response}")
@@ -956,6 +967,9 @@ class VoiceCoder:
                             retval = '{"success":true}'
                         elif func_name == 'redo':
                             self.event_queue.put((EventType.INPUT, (b'r', None)))
+                            retval = '{"success":true}'
+                        elif func_name == 'open':
+                            self.event_queue.put((EventType.OPEN, args['filename'], args.get('discard_changes', False)))
                             retval = '{"success":true}'
                         elif func_name == 'save':
                             self.event_queue.put((EventType.INPUT, (b'w', None)))
@@ -1199,7 +1213,7 @@ class VoiceCoder:
         except KeyboardInterrupt:
             self.set_message('Cancelled')
         else:
-            self.save()
+            self.set_message('Opened file: ' + self.filename)
 
     def _handle_input(self, input_data: InputData) -> bool:
         try:
@@ -1357,6 +1371,12 @@ class VoiceCoder:
                         elif event[0] == EventType.CLEAR_MESSAGE:
                             self.clear_message()
 
+                        elif event[0] == EventType.OPEN:
+                            if self.saved or event[2]:
+                                self.open_file(event[1])
+                                self.set_message('Opened file: ' + self.filename)
+                            else:
+                                self.set_message('There are unsaved changes!', LEVEL_WARNING)
                         else:
                             logger.error(f'unhandled event: {event}')
 
